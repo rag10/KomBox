@@ -36,9 +36,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/<tu-usuario>/kombox"
-Repository = "https://github.com/<tu-usuario>/kombox"
-Issues = "https://github.com/<tu-usuario>/kombox/issues"
+Homepage = "https://github.com/rag10kombox"
+Repository = "https://github.com/rag10kombox"
+Issues = "https://github.com/rag10kombox/issues"
 
 [tool.setuptools.packages.find]
 include = ["kombox*"]
