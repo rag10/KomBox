@@ -1,0 +1,54 @@
+kombox/
+├── __init__.py
+├── core/
+│   ├── __init__.py
+│   ├── block.py          # Clase Block (inputs, outputs, parámetros, helpers)
+│   ├── model.py          # Clase Model (hereda Block; gestiona grafo, submodelos)
+│   ├── simulator.py      # Clase Simulator (step, run, simulate con bucle integrado)
+│   └── recorders.py       # Recorders: MemoryRecorder, CSVRecorder, NPZStreamer
+├── blocks/
+│   ├── __init__.py
+│   ├── basic.py          # Adder, Gain, Const, Integrator, etc.
+│   ├── mechanical.py     # Mass1D, Spring, Damper, MSD composites
+│   ├── electrical.py     # Resistor, Capacitor, Inductor, VoltageSource, etc.
+│   └── control.py        # PID, SumError, etc.
+├── utils/
+│   ├── __init__.py
+│   ├── param_grid.py     # Generación de combinaciones de parámetros en batch
+│   └── helpers.py        # Funciones utilitarias varias (validaciones, etc.)
+├── analysis/
+│   ├── __init__.py
+│   └── bode.py           # Bode diferenciable (impulso+FFT)
+└── examples/
+
+Aquí va un roadmap mínimo pero completo para KomBox, con filosofía, set de solvers imprescindible, y cambios en core/ para que todo sea extensible, manteniendo el backprop end‑to‑end.
+
+🎯 Filosofía KomBox
+
+Autograd-first: todo en PyTorch (JVP/VJP, linalg.solve, nada de .detach()), para que el gradiente fluya a través de solves, lazos y restricciones.
+
+DAE-ready: tratar el modelo como DAE índice‑1 por defecto; ODEs son un caso particular.
+
+Arquitectura enchufable: “steppers” (explícitos/implícitos) y “algebraic solvers” como plugins con una interfaz común.
+
+SCC & residuals: detectar componentes fuertemente conectadas y montar un residual global (ecuaciones algebraicas + restricciones) que se resuelve con Newton.
+
+Diagnóstico y degradación elegante: si Newton no converge → reducir dt, activar line search o conmutar a un implícito más robusto (sin romper el grafo).
+
+
+Roadmap comparativo (mínimos que cubren “todo”)
+Necesidad industrial	Equivalente Simscape/AMESim	KomBox (fase)	Justificación
+No rígidos, prototipado	ode45 (RK45)	F1: RK45 adaptativo	Cubre el 80% de casos suaves.
+Circuitos/mecánica estable	ode23t (Trap.)	F1: Trapezoidal implícito	Sencillo, estable, ideal para DAEs eléctricas.
+Rígidos/DAE serios	ode15s (BDF)	F2: BDF2 (orden fijo)	Núcleo de los “grandes” con coste controlado.
+Robustez extra	ode23tb (TR‑BDF2)	F3: TR‑BDF2	Excelente compromiso estabilidad/coste.
+Lazos algebraicos	Algebraic loop solver	F1: Newton/Newton‑Krylov	Imprescindible para ciclos.
+Restricciones	KKT / complement.	F2: KKT + desigualdades (penalty/FB)	DAEs con constraints y contactos.
+
+Fases sugeridas
+
+F1 (MVP DAEs): RK45, Trapezoidal, Newton‑Krylov (algebraic), SCC + residual builder, diagnósticos.
+
+F2 (robustez): BDF2, KKT (λ en z), desigualdades (penalty o Fisher‑Burmeister suave), event hooks.
+
+F3 (premium): TR‑BDF2, Rosenbrock‑W(2), proyección opcional, control adaptativo de tolerancias y paso.

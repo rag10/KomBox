@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.build/
+build/
+dist/
+.venv/
+venv/
+.env
+.conda/
+*.egg
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# KomBox runs / recordings
+runs/
+*.npz
+
+# Jupyter (si usas)
+.ipynb_checkpoints/

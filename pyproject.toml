@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kombox"
+version = "0.1.0"
+description = "KomBox: framework de modelado por bloques en PyTorch con simulación diferenciable."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "KomBox Team" }
+]
+keywords = ["pytorch", "simulation", "differentiable", "dae", "ode", "control", "systems", "blocks"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering",
+  "Framework :: PyTorch",
+]
+
+dependencies = [
+  "torch>=2.1",
+]
+
+[project.optional-dependencies]
+dae = ["torchdiffeq>=0.2.3"]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "black>=24.0",
+  "ruff>=0.6.0",
+  "mypy>=1.7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/<tu-usuario>/kombox"
+Repository = "https://github.com/<tu-usuario>/kombox"
+Issues = "https://github.com/<tu-usuario>/kombox/issues"
+
+[tool.setuptools.packages.find]
+include = ["kombox*"]
+
+[tool.pytest.ini_options]
+testpaths = ["kombox/tests"]
+norecursedirs = ["kombox_backup_*", ".*", "build", "dist", "venv", ".venv", ".git", "__pycache__"]
+addopts = "-q -ra --maxfail=1 --disable-warnings"
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+filterwarnings = [
+  "ignore::DeprecationWarning:torchdiffeq\..*",
+  "ignore::UserWarning:torch\..*",
+]

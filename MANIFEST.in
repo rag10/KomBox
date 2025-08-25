@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+recursive-include kombox *.py
+recursive-include kombox *.typed
+recursive-include examples *.py
+recursive-include tests *.py
