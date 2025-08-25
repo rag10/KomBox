@@ -1,5 +1,15 @@
 from ..core.block import ContinuousBlock
 
+class PassThrough(ContinuousBlock):
+    def __init__(self, width=1, gain=1.0):
+        super().__init__()
+        self.declare_io(inputs={"in": width}, outputs={"out": width})
+
+    def ode(self, state, inputs, t):
+        u = inputs["in"]
+        dx = state.new_zeros((state.shape[0], self.state_size()))
+        return dx, {"out": u}
+
 class Constant(ContinuousBlock):
     def __init__(self, width=1, value=0.0):
         super().__init__()
@@ -12,7 +22,6 @@ class Constant(ContinuousBlock):
         if val.shape[1] == 1 and width > 1: val = val.expand(-1, width)
         dx = state.new_zeros((state.shape[0], self.state_size()))
         return dx, {"out": val}
-
 
 class Gain(ContinuousBlock):
     def __init__(self, width=1, gain=1.0):

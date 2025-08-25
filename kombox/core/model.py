@@ -2,13 +2,14 @@
 from __future__ import annotations
 from typing import Dict, Mapping, Tuple, Optional, List
 from collections import deque
+import inspect
 import torch
 import torch.nn as nn
 
 from .block import Block
+from .topology import FeedthroughGraph
 
 _EXT = "__external__"
-
 
 class Model(Block):
     """
@@ -47,6 +48,13 @@ class Model(Block):
         self._compl_constraints: Dict[str, tuple] = {}  # name -> (c_fn, lambda_name)
         self._z_layout: Optional[Dict[str, object]] = None  # planificación de variables algebraicas
 
+        self._edges = []                 # lista de (src_blk, src_port, dst_blk, dst_port)
+        self._constraints = []           # lista de (name, fn)
+        self.topology = type("Topo", (), {"sccs": []})()
+
+        self._has_pure_algebraic_cycle = False
+        self._algebraic_cycles = []  # lista de ciclos detectados (por nombres de bloque)
+
 # ---------------- estructura ----------------
     def add_block(self, name: str, block: Block):
         if name in self.blocks:
@@ -64,6 +72,7 @@ class Model(Block):
             return _EXT, ep
         sblk, sport = parse(src); dblk, dport = parse(dst)
         self._raw_connections.append((sblk, sport, dblk, dport))
+        self._edges.append((sblk, sport, dblk, dport))
         return self
 
     def connect_from_strings(self, *arrows: str):
@@ -101,35 +110,43 @@ class Model(Block):
         self._feedthrough_cache[name] = changed
         return changed
 
-    def _toposort_or_cycle(self, nodes: List[str], edges: List[Tuple[str, str]]) -> List[str]:
-        adj = {u: [] for u in nodes}; indeg = {u: 0 for u in nodes}
-        for u, v in edges: adj[u].append(v); indeg[v] += 1
-        from collections import deque
-        q = deque([u for u in nodes if indeg[u] == 0]); out: List[str] = []
-        while q:
-            u = q.popleft(); out.append(u)
-            for v in adj[u]:
-                indeg[v] -= 1
-                if indeg[v] == 0: q.append(v)
-        if len(out) == len(nodes): return out
-        # reconstrucción de ciclo simple
-        color = {u: 0 for u in nodes}; stack: List[str] = []
+    def _toposort_or_cycle(self, nodes, edges):
+        adj = {u: [] for u in nodes}
+        for u, v in edges:
+            adj[u].append(v)
+        color = {u: 0 for u in nodes}  # 0=white,1=gray,2=black
+        stack = []
+        order = []
+
         def dfs(u: str):
             color[u] = 1; stack.append(u)
             for v in adj[u]:
                 if color[v] == 0:
-                    if dfs(v): return True
+                    if dfs(v): 
+                        return True
                 elif color[v] == 1:
-                    cyc = [v]; i = len(stack)-1
-                    while i >= 0 and stack[i] != v: cyc.append(stack[i]); i -= 1
+                    # ciclo detectado
+                    cyc = [v]; i = len(stack) - 1
+                    while i >= 0 and stack[i] != v:
+                        cyc.append(stack[i]); i -= 1
                     cyc.append(v); cyc.reverse()
-                    raise ValueError("Algebraic loop detected (purely algebraic cycle): " +
-                                     " -> ".join(cyc) +
-                                     ". Inserta integrador/masa/retardo o usa solver implícito.")
-            stack.pop(); color[u] = 2; return False
+                    # En vez de lanzar, marcamos y guardamos
+                    self._has_pure_algebraic_cycle = True
+                    self._algebraic_cycles.append(cyc)
+                    # devolvemos True para cortar búsqueda aquí,
+                    # pero NO lanzamos excepción
+                    return True
+            color[u] = 2; order.append(u); stack.pop()
+            return False
+
         for u in nodes:
-            if color[u] == 0: dfs(u)
-        raise ValueError("Algebraic loop detected in feedthrough subgraph.")
+            if color[u] == 0:
+                if dfs(u):
+                    # Hemos visto un ciclo. Devolvemos un orden parcial (vacío) para indicar
+                    # que hay lazos algebraicos; build continuará y podremos usar SCCs.
+                    return []
+        order.reverse()
+        return order
 
     def _normalize_connections(self):
         self.connections = []
@@ -277,10 +294,10 @@ class Model(Block):
 
     # ---------------- DAE: registro de restricciones y residual global ----------------
     def add_constraint_eq(self, name: str, fn):
-        """Registra una restricción de igualdad h(t,x,z,u,params)=0 (Tensor (B,r))."""
-        if name in self._eq_constraints:
-            raise KeyError(f"Constraint '{name}' ya existe.")
-        self._eq_constraints[name] = fn
+        """Registra una restricción/ecuación global g(...)=0.
+        fn: callable(t, states, inbuf, model[, z]) -> Tensor (B, m)
+        """
+        self._constraints.append((name, fn))
         return self
 
     def add_complementarity(self, name: str, c_fn, lambda_name: Optional[str] = None):
@@ -295,52 +312,117 @@ class Model(Block):
     def build_residual(
         self,
         t: float,
-        x_all: Dict[str, torch.Tensor],
-        u_all: Dict[str, Dict[str, torch.Tensor]],
+        states: Optional[Dict[str, torch.Tensor]] = None,
+        inbuf: Optional[Mapping[str, Mapping[str, torch.Tensor]]] = None,
         z: Optional[torch.Tensor] = None,
-        params_all: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
-    ) -> torch.Tensor:
-        """
-        Concatena residuales algebraicos globales:
-         (1) Residuales locales de bloques (algebraic_residual())
-         (2) Restricciones de igualdad registradas con add_constraint_eq()
-        MVP: el residual de cierre de lazos (SCC) se incorporará en PR posterior.
-        Devuelve Tensor (B, R) o (B,0) si no hay residuales.
-        """
-        B = None; device = None; dtype = None
-        for st in x_all.values():
-            B = st.shape[0]; device = st.device; dtype = st.dtype; break
-        if B is None:
-            for m in u_all.values():
-                for ten in m.values():
-                    B = ten.shape[0]; device = ten.device; dtype = ten.dtype; break
-                if B is not None: break
-        if B is None:
-            B, device, dtype = 1, torch.device("cpu"), torch.float32
+        params_all: Optional[Dict[str, dict]] = None,
+    ):
+        """Concatena residuales algebraicos de bloques + restricciones globales.
+        Retorna: (Tensor (B, R_total), detail: dict por-bloque+global).
 
-        chunks = []
+        - NO requiere haber llamado a `initialize()` si `states` es None (soporta casos puramente algebraicos).
+        - Acepta `z` por compatibilidad con solvers implícitos.
+        """
+        # Nunca acceder a self.states si el caller no lo pasó
+        states_in: Dict[str, torch.Tensor] = {} if states is None else states
+        # Si inbuf no viene, poner dict vacío por bloque
+        if inbuf is None:
+            inbuf = {n: {} for n in self.blocks.keys()}
 
-        # (1) residuales algebraicos locales por bloque
+        pieces: List[torch.Tensor] = []
+        detail: Dict[str, torch.Tensor] = {}
+
+        def _ensure_2d(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor if tensor.ndim == 2 else tensor.view(tensor.shape[0], -1)
+
+        # Inferir B: primero desde estados_in, si no, desde inbuf, si no, B=1
+        B = None
+        for v in states_in.values():
+            if isinstance(v, torch.Tensor) and v.numel() > 0:
+                B = v.shape[0]
+                break
+        if B is None:
+            for bd in inbuf.values():
+                for ten in bd.values():
+                    if isinstance(ten, torch.Tensor) and ten.numel() > 0:
+                        B = ten.shape[0]
+                        break
+                if B is not None:
+                    break
+        if B is None:
+            B = 1
+
+        # Residuales locales por bloque
         for bname, blk in self.blocks.items():
-            xi = x_all.get(bname, None)
-            ui = u_all.get(bname, {})
-            gres = blk.algebraic_residual(t, xi, ui, getattr(blk, "params", {}))
+            state = states_in.get(bname, torch.empty((B, 0), dtype=torch.float32))
+            inputs = inbuf.get(bname, {})
+            gres = blk.algebraic_residual(t, state, inputs, getattr(blk, "params", None))
+
             if isinstance(gres, dict):
-                for ten in gres.values():
-                    if ten is not None and ten.numel() > 0:
-                        chunks.append(ten.reshape(B, -1))
-            elif isinstance(gres, torch.Tensor) and gres.numel() > 0:
-                chunks.append(gres.reshape(B, -1))
+                if len(gres) > 0:
+                    cols = []
+                    for v in gres.values():
+                        v = _ensure_2d(v)
+                        if v.shape[0] == 1 and B > 1:
+                            v = v.expand(B, -1)           # <<< expandimos batch 1 → B
+                        elif v.shape[0] not in (1, B):
+                            raise ValueError(
+                                f"Residual local de '{bname}' con batch={v.shape[0]} incompatible con B={B}"
+                            )
+                        cols.append(v)
+                    gcat = torch.cat(cols, dim=1)
+                    pieces.append(gcat); detail[bname] = gcat
 
-        # (2) restricciones de igualdad globales
-        for _n, fn in self._eq_constraints.items():
-            h = fn(t, x_all, z, u_all, params_all or {})
-            if isinstance(h, torch.Tensor) and h.numel() > 0:
-                chunks.append(h.reshape(B, -1))
+            elif hasattr(gres, "ndim"):
+                if gres.numel() > 0:
+                    gres = _ensure_2d(gres)
+                    if gres.shape[0] == 1 and B > 1:
+                        gres = gres.expand(B, -1)         # <<< expandimos batch 1 → B
+                    elif gres.shape[0] not in (1, B):
+                        raise ValueError(
+                            f"Residual local de '{bname}' con batch={gres.shape[0]} incompatible con B={B}"
+                        )
+                    pieces.append(gres); detail[bname] = gres
 
-        if not chunks:
-            return torch.zeros((B, 0), device=device, dtype=dtype)
-        return torch.cat(chunks, dim=-1)
+        # Restricciones globales (acepta 4 o 5 argumentos)
+        for name, fn in self._constraints:
+            g = None
+            try:
+                sig = inspect.signature(fn)
+                if len(sig.parameters) >= 5:
+                    g = fn(t, states_in, inbuf, self, z)
+                else:
+                    g = fn(t, states_in, inbuf, self)
+            except TypeError:
+                try:
+                    g = fn(t, states_in, inbuf)
+                except TypeError as e:
+                    raise TypeError(f"Constraint '{name}' no acepta firma compatible") from e
+
+            if g is None:
+                continue
+            g = _ensure_2d(g)
+            if g.shape[0] == 1 and B > 1:
+                g = g.expand(B, -1)                       # <<< expandimos batch 1 → B
+            elif g.shape[0] not in (1, B):
+                raise ValueError(
+                    f"Constraint '{name}' con batch={g.shape[0]} incompatible con B={B}"
+                )
+
+            pieces.append(g); detail[f"__global__::{name}"] = g
+
+        if len(pieces) == 0:
+            return torch.zeros((B, 0), dtype=torch.float32), detail
+        return torch.cat(pieces, dim=1), detail
+
+    def analyze_topology(self):
+        g = FeedthroughGraph()
+        for bname in self.blocks.keys():
+            g.add_node(bname)
+        for (sb, sp, db, dp) in getattr(self, "_edges", []):
+            g.add_edge(sb, db)
+        self.topology.sccs = g.sccs()
+        return self.topology.sccs
 
     # ---------------- utilidades ----------------
     def required_externals(self) -> List[str]:
