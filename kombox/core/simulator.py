@@ -131,6 +131,17 @@ class Simulator:
         ext_from_fn = externals_fn(self.t, self.k) if externals_fn is not None else None
         eff_ext = self._merge_two_level(externals, ext_from_fn)
 
+        # si el modelo tiene lazos algebraicos y el solver no es global/implícito, abortar aquí
+        if getattr(self.model, "_has_pure_algebraic_cycle", False):
+            # por-bloque/explicitos suelen anunciarse con is_global = False
+            if not getattr(self.solver, "is_global", False):
+                cycles = getattr(self.model, "_algebraic_cycles", [])
+                msg = " ; ".join(" -> ".join(c) for c in cycles) if cycles else "algebraic loop detected"
+                raise ValueError(
+                    f"Modelo contiene lazos algebraicos puros ({msg}). "
+                    f"Usa un solver implícito/global (p.ej., Trapezoidal/DAE)."
+                )
+
         # --- Ruta solver GLOBAL (torchdiffeq) ---
         if getattr(self.solver, "is_global", False):
             # construir función de externals dependiente de t para los subpasos internos
@@ -296,3 +307,54 @@ class Simulator:
                     last_report = now
 
         return last
+
+    # --- CheckPoints ---------------------------------------------
+    def make_checkpoint(self, detach: bool = True) -> dict:
+        """
+        Captura un checkpoint del estado de la simulación.
+        - detach=True: clona y *detachea* (no guarda la historia de autograd).
+        - detach=False: clona manteniendo la historia (útil si vas a backpropagar).
+        """
+        # Estados del modelo en el dispositivo actual
+        states_snap = {}
+        for blk_name, ten in self.model.states.items():
+            if detach:
+                states_snap[blk_name] = ten.detach().clone()
+            else:
+                # clone() mantiene la conexión al grafo de autograd
+                states_snap[blk_name] = ten.clone()
+
+        chk = {
+            "t": float(self.t),
+            "k": int(self.k),
+            "states": states_snap,
+            # Si alguna vez guardas algo más (semillas, solver interno, etc.), añádelo aquí.
+        }
+        return chk
+
+    def restore_checkpoint(self, chk: dict) -> None:
+        """
+        Restaura un checkpoint creado con make_checkpoint.
+        No toca dtype/device: usa tal cual los tensores guardados en el checkpoint.
+        """
+        if not isinstance(chk, dict):
+            raise TypeError("Checkpoint inválido: se esperaba un dict.")
+
+        if "t" not in chk or "k" not in chk or "states" not in chk:
+            raise KeyError("Checkpoint incompleto: faltan 't', 'k' o 'states'.")
+
+        self.t = float(chk["t"])
+        self.k = int(chk["k"])
+
+        # Reemplaza completamente los estados del modelo
+        states_in = chk["states"]
+        for blk_name, ten in states_in.items():
+            if blk_name not in self.model.states:
+                raise KeyError(f"Checkpoint contiene bloque desconocido '{blk_name}'.")
+            self.model.states[blk_name] = ten
+
+        # Limpia buffers de entrada/auxiliares si existen
+        if hasattr(self, "_inbuf") and isinstance(self._inbuf, dict):
+            for d in self._inbuf.values():
+                if isinstance(d, dict):
+                    d.clear()

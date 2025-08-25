@@ -1,54 +1,191 @@
-kombox/
-├── __init__.py
-├── core/
-│   ├── __init__.py
-│   ├── block.py          # Clase Block (inputs, outputs, parámetros, helpers)
-│   ├── model.py          # Clase Model (hereda Block; gestiona grafo, submodelos)
-│   ├── simulator.py      # Clase Simulator (step, run, simulate con bucle integrado)
-│   └── recorders.py       # Recorders: MemoryRecorder, CSVRecorder, NPZStreamer
-├── blocks/
-│   ├── __init__.py
-│   ├── basic.py          # Adder, Gain, Const, Integrator, etc.
-│   ├── mechanical.py     # Mass1D, Spring, Damper, MSD composites
-│   ├── electrical.py     # Resistor, Capacitor, Inductor, VoltageSource, etc.
-│   └── control.py        # PID, SumError, etc.
-├── utils/
-│   ├── __init__.py
-│   ├── param_grid.py     # Generación de combinaciones de parámetros en batch
-│   └── helpers.py        # Funciones utilitarias varias (validaciones, etc.)
-├── analysis/
-│   ├── __init__.py
-│   └── bode.py           # Bode diferenciable (impulso+FFT)
-└── examples/
+Plan F2 (en 4 hitos cortos)
 
-Aquí va un roadmap mínimo pero completo para KomBox, con filosofía, set de solvers imprescindible, y cambios en core/ para que todo sea extensible, manteniendo el backprop end‑to‑end.
+F2.1 – SCC + residual global
 
-🎯 Filosofía KomBox
+Detectar SCCs (componentes fuertemente conexas) del grafo de feedthrough.
 
-Autograd-first: todo en PyTorch (JVP/VJP, linalg.solve, nada de .detach()), para que el gradiente fluya a través de solves, lazos y restricciones.
+Model.build_residual(...) que concatene residuales locales (Block.algebraic_residual) + restricciones globales (add_constraint_eq).
 
-DAE-ready: tratar el modelo como DAE índice‑1 por defecto; ODEs son un caso particular.
+F2.2 – Solver Trapezoidal implícito + Newton-Krylov (JFNK)
 
-Arquitectura enchufable: “steppers” (explícitos/implícitos) y “algebraic solvers” como plugins con una interfaz común.
+TrapezoidalSolver(step_all) con residual implícito y Newton sin Jacobiano explícito (JVP autograd) + GMRES simple.
 
-SCC & residuals: detectar componentes fuertemente conectadas y montar un residual global (ecuaciones algebraicas + restricciones) que se resuelve con Newton.
+F2.3 – Inicialización consistente de DAEs
 
-Diagnóstico y degradación elegante: si Newton no converge → reducir dt, activar line search o conmutar a un implícito más robusto (sin romper el grafo).
+Simulator.initialize_consistent(...): resolver g(x0,z0)=0 (y, si hace falta, ḡ=0).
+
+F2.4 – Estabilización y proyección
+
+Baumgarte opcional y proyección pos-paso para mantener g≈0 sin romper autograd.
+
+Cada hito: añade tests + ejemplo mínimo (péndulo, KCL, etc.).
+
+Git para dummies (flujo recomendado)
+Antes de empezar
+# asegúrate de estar en main y limpio
+git switch main           # o: git checkout main
+git pull                  # trae lo último de GitHub
+pytest -q                 # todo en verde antes de ramificar
+
+Hito F2.1 — Rama, commits, PR y merge
+
+Crea la rama de feature
+
+git switch -c feature/f2-scc-residual
+# (equivale a: git checkout -b feature/f2-scc-residual)
 
 
-Roadmap comparativo (mínimos que cubren “todo”)
-Necesidad industrial	Equivalente Simscape/AMESim	KomBox (fase)	Justificación
-No rígidos, prototipado	ode45 (RK45)	F1: RK45 adaptativo	Cubre el 80% de casos suaves.
-Circuitos/mecánica estable	ode23t (Trap.)	F1: Trapezoidal implícito	Sencillo, estable, ideal para DAEs eléctricas.
-Rígidos/DAE serios	ode15s (BDF)	F2: BDF2 (orden fijo)	Núcleo de los “grandes” con coste controlado.
-Robustez extra	ode23tb (TR‑BDF2)	F3: TR‑BDF2	Excelente compromiso estabilidad/coste.
-Lazos algebraicos	Algebraic loop solver	F1: Newton/Newton‑Krylov	Imprescindible para ciclos.
-Restricciones	KKT / complement.	F2: KKT + desigualdades (penalty/FB)	DAEs con constraints y contactos.
+Programa/cambia archivos (por ejemplo):
 
-Fases sugeridas
+kombox/core/model.py: build_residual, add_constraint_eq, pack/unpack.
 
-F1 (MVP DAEs): RK45, Trapezoidal, Newton‑Krylov (algebraic), SCC + residual builder, diagnósticos.
+kombox/core/topology.py (si tienes): Tarjan/Kosaraju para SCC.
 
-F2 (robustez): BDF2, KKT (λ en z), desigualdades (penalty o Fisher‑Burmeister suave), event hooks.
+Tests: tests/test_dae_scc.py (nuevo).
 
-F3 (premium): TR‑BDF2, Rosenbrock‑W(2), proyección opcional, control adaptativo de tolerancias y paso.
+Revisa qué cambiaste
+
+git status
+git diff                  # mira el diff
+
+
+Añade y comitea
+
+git add -A
+git commit -m "feat(scc): residual global y detección de SCC en feedthrough"
+
+
+Sube la rama a GitHub
+
+git push -u origin feature/f2-scc-residual
+
+
+Abre un PR en GitHub (de feature/f2-scc-residual → main)
+
+Título sugerido: feat(scc): residual global + SCC
+
+En la descripción, pega un resumen y cómo correr los tests.
+
+Cuando CI esté verde, haz merge (botón “Merge”).
+
+Vuelve a main y actualiza localmente
+
+git switch main
+git pull
+
+
+(Opcional) Borra la rama ya fusionada
+
+git branch -d feature/f2-scc-residual
+git push origin :feature/f2-scc-residual
+
+Hito F2.2 — Trapezoidal + Newton-Krylov
+
+Nueva rama
+
+git switch -c feature/f2-trapezoidal-jfnk
+
+
+Implementa (archivos típicos):
+
+kombox/core/solvers_trapezoidal.py: class TrapezoidalSolver(SolverBase, is_global=True).
+
+kombox/algebra/newton_krylov.py: solve(F, x0, ...) + gmres(Ap, b, ...).
+
+Conecta en __init__.py para exportar el solver.
+
+Tests: tests/test_trapezoidal_solver.py (pendulum/KCL), tests/test_jfnk_basic.py.
+
+Commit/push/PR/merge (igual que arriba):
+
+git add -A
+git commit -m "feat(solver): trapezoidal implícito + newton-krylov jvp"
+git push -u origin feature/f2-trapezoidal-jfnk
+# Abre PR → CI verde → Merge → volver a main → git pull
+
+Hito F2.3 — Inicialización consistente
+
+Nueva rama
+
+git switch -c feature/f2-dae-init
+
+
+Implementa:
+
+Simulator.initialize_consistent(externals_fn=None, ...)
+
+Usa Newton local sobre g(x0,z0)=0.
+
+Tests: tests/test_dae_init.py (péndulo/circuito).
+
+Commit/push/PR/merge
+
+git add -A
+git commit -m "feat(dae): inicialización consistente g(x0,z0)=0"
+git push -u origin feature/f2-dae-init
+
+Hito F2.4 — Baumgarte + proyección
+
+Nueva rama
+
+git switch -c feature/f2-stabilization-projection
+
+
+Implementa:
+
+Parámetros alpha, beta (Baumgarte) en solver implícito (opcional activar).
+
+Proyección pos-paso: x <- argmin ||x-x*|| s.t. g(x)=0 (pequeño Newton).
+
+Tests: tests/test_constraint_drift.py (comparar drift con/sin proyección).
+
+Commit/push/PR/merge
+
+git add -A
+git commit -m "feat(dae): estabilización de restricciones y proyección pos-paso"
+git push -u origin feature/f2-stabilization-projection
+
+Publica F2 como v0.2.0
+
+Bump de versión en pyproject.toml → version = "0.2.0"
+
+Commit de release
+
+git add pyproject.toml
+git commit -m "chore(release): bump to v0.2.0"
+git push
+
+
+Crea el tag y súbelo
+
+git tag -a v0.2.0 -m "KomBox v0.2.0 (F2)"
+git push origin v0.2.0
+
+
+(Luego puedes crear la Release en GitHub usando ese tag.)
+
+“Plan B” (si prefieres TODO en una sola rama)
+git switch -c F2
+# Trabajas por commits lógicos (uno por hito)
+git add -A
+git commit -m "feat(scc): residual + scc"
+git commit -m "feat(solver): trapezoidal + jfnk"
+git commit -m "feat(dae): init consistente"
+git commit -m "feat(dae): baumgarte + proyección"
+git push -u origin F2
+# PR: F2 → main, merge, tag v0.2.0
+
+Chuletario de Git (dos cosas clave)
+
+Actualizar tu rama con cambios de main (si pasa tiempo):
+
+git fetch origin
+git rebase origin/main         # re-aplica tus commits encima de main
+# resuelve conflictos → git add archivos → git rebase --continue
+git push --force-with-lease    # actualiza tu rama en GitHub
+
+
+Deshacer el último commit (sin perder cambios):
+
+git reset --soft HEAD~1
+# corrige archivos → git add -A → git commit -m "mensaje corregido"

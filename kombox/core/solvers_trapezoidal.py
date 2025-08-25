@@ -76,7 +76,19 @@ class TrapezoidalSolver(SolverBase):
         # 1) Resolver residual algebraico en t (MVP: con estados actuales)
         inbuf_t, _ = phaseA_eval(states, t)
         z0 = torch.zeros((B, 0), device=device, dtype=dtype)
-        F_now = lambda z: model.build_residual(t, states, {k: dict(v) for k,v in inbuf_t.items()}, z)
+
+        def F_now(z):
+            # Llama a build_residual de forma compatible con firmas antiguas/nuevas
+            try:
+                r = model.build_residual(t, states, {k: dict(v) for k, v in inbuf_t.items()}, z=z)
+            except TypeError:
+                # Compatibilidad: versiones sin 'z'
+                r = model.build_residual(t, states, {k: dict(v) for k, v in inbuf_t.items()})
+            # Compatibilidad: si devuelve (residual, detalle), nos quedamos con el residual
+            if isinstance(r, tuple):
+                r = r[0]
+            return r
+
         z_now = self.alg.solve(F_now, z0)  # noqa: F841
 
         # 2) Integrar continuos por-bloque (trap predictor-corrector usando ins en t y t+dt)
