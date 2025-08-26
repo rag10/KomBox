@@ -14,7 +14,37 @@ class SolverBase:
                  externals_time_fn: Optional[Callable[[float], Dict[str, Dict[str, torch.Tensor]]]] = None):
         raise NotImplementedError
 
+# ---------- Registro sencillo ----------
+_SOLVER_REGISTRY = {}
 
+def register_solver(cls):
+    _SOLVER_REGISTRY[cls.name] = cls
+    return cls
+
+def get_solver(name: str):
+    return _SOLVER_REGISTRY[name]
+
+def auto_solver_for(model) -> 'SolverBase':
+    """Devuelve un solver por defecto acorde al modelo:
+    - Si hay lazos algebraicos puros -> Trapezoidal + NewtonKrylov (si disponible).
+    - En otro caso -> Euler.
+    """
+    try:
+        has_loops = bool(getattr(model, "_has_pure_algebraic_cycle", False))
+    except Exception:
+        has_loops = False
+    if has_loops:
+        # Carga perezosa para evitar dependencias circulares
+        try:
+            from .solvers_trapezoidal import TrapezoidalSolver
+            from .algebraic.newton_krylov import NewtonKrylov
+            return TrapezoidalSolver(algebraic_solver=NewtonKrylov())
+        except Exception:
+            # Fallback conservador
+            return EulerSolver()
+    return EulerSolver()
+
+@register_solver
 class EulerSolver(SolverBase):
     name = "euler"
     def step_continuous(self, block, state, inputs, dt, t):
@@ -24,7 +54,7 @@ class EulerSolver(SolverBase):
         new_state = state + dt * dx
         return new_state, outs
 
-
+@register_solver
 class RK4Solver(SolverBase):
     name = "rk4"
     def step_continuous(self, block, state, inputs, dt, t):
@@ -38,7 +68,7 @@ class RK4Solver(SolverBase):
         new_state = state + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
         return new_state, outs
 
-
+@register_solver
 class RK45Solver(SolverBase):
     name = "rk45"
 
@@ -72,7 +102,6 @@ class RK45Solver(SolverBase):
         else:
             self.last_error = err
         return y5, outs_end
-
 
 # -------------------------- TorchDiffEq (global) ------------------------------
 class TorchDiffEqSolver(SolverBase):

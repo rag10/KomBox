@@ -391,29 +391,6 @@ class Block(nn.Module):
         for name, spec in self.out_specs.items():
             self._check_tensor_matrix(outputs[name], rows=batch_size, cols=spec.n, kind="output", name=name)
 
-    # ===================== API de simulación =====================
-    def outputs(self, state: torch.Tensor, inputs: Mapping[str, torch.Tensor], current_time: float):
-        """
-        Calcula salidas en el tiempo actual sin avanzar estado.
-        Por defecto, delega en step(state, inputs, dt=0) y devuelve las salidas.
-        """
-        _, outs = self.step(state, inputs, 0.0)
-        return outs
-
-    def deriv(self, state: torch.Tensor, inputs: Mapping[str, torch.Tensor], current_time: float):
-        """
-        Para bloques continuos con estado: devuelve (dx, outs).
-        Implementa si tu bloque se usa con solver de derivadas (RK, torchdiffeq, etc.).
-        """
-        raise NotImplementedError
-
-    def step(self, state: torch.Tensor, inputs: Mapping[str, torch.Tensor], time_step: float):
-        """
-        Para bloques discretos o implementación personalizada de avance.
-        Devuelve (new_state, outs).
-        """
-        raise NotImplementedError
-    
     # ---- DAE/Algebraic (opcional) ----
     def algebraic_residual(
         self,
@@ -460,3 +437,34 @@ class DiscreteBlock(Block):
 
     def _advance(self, state, inputs, dt, t, solver):
         return self.update(state, inputs, float(dt), float(t))
+
+# ===================== Helpers sencillos =====================
+class _FunctionalContinuous(ContinuousBlock):
+    def __init__(self, fn, *, inputs, outputs, state_size):
+        super().__init__()
+        self._fn = fn
+        self.declare_io(inputs=inputs, outputs=outputs, state_size=state_size)
+    def ode(self, state, inputs, t):
+        return self._fn(state, inputs, t)
+
+class _FunctionalDiscrete(DiscreteBlock):
+    def __init__(self, fn, *, inputs, outputs, state_size=0):
+        super().__init__()
+        self._fn = fn
+        self.declare_io(inputs=inputs, outputs=outputs, state_size=state_size)
+    def update(self, state, inputs, dt, t):
+        return self._fn(state, inputs, dt, t)
+
+def from_ode(fn, *, inputs, outputs, state_size):
+    """
+    Crea un bloque continuo desde una función:
+        fn(state, inputs, t) -> (dx, outs)
+    """
+    return _FunctionalContinuous(fn, inputs=inputs, outputs=outputs, state_size=state_size)
+
+def from_update(fn, *, inputs, outputs, state_size=0):
+    """
+    Crea un bloque discreto desde una función:
+        fn(state, inputs, dt, t) -> (new_state, outs)
+    """
+    return _FunctionalDiscrete(fn, inputs=inputs, outputs=outputs, state_size=state_size)
