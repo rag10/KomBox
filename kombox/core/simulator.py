@@ -9,7 +9,8 @@ import time
 
 from .model import Model
 from .block import Block
-from .solvers import SolverBase, EulerSolver
+from .solvers import SolverBase, EulerSolver, auto_solver_for
+
 
 
 class Simulator:
@@ -31,7 +32,7 @@ class Simulator:
             raise RuntimeError("Simulator: el Model no tiene estados. Llama a model.initialize(...).")
 
         self.model = model
-        self.solver = solver if solver is not None else EulerSolver()
+        self.solver = solver if solver is not None else auto_solver_for(model)
         self._last_dt: float | None = None
         self.validate_io = bool(validate_io)
         self.strict_numerics = bool(strict_numerics)
@@ -68,6 +69,96 @@ class Simulator:
     def states(self) -> Dict[str, torch.Tensor]: return self.model.states
 
     def reset_time(self): self.t = 0.0; self.k = 0
+
+    # --- inicialización consistente de DAEs ---------------------
+    def initialize_consistent(
+        self,
+        t0: float = 0.0,
+        externals_fn=None,
+        solver=None,
+        tol: float = 1e-8,
+        max_iter: int = 20,
+    ):
+        """
+        MVP de inicialización consistente de DAEs.
+
+        - Construye el buffer de entradas (inbuf) con las *externals* en t0.
+        - Ensambla el residual global con model.build_residual(t0, states=None, inbuf=inbuf).
+        - Si hay variables algebraicas 'z' (MVP: z_dim=0), intentaría resolver F(z)=0 con 'solver'.
+        En este MVP no definimos z explícitamente, por lo que solo comprobamos el residual.
+        - No modifica estados; devuelve info diagnóstica.
+
+        Retorna:
+        dict con claves: residual (Tensor BxR), residual_norm (float),
+                        detail (dict), B (int), z_dim (int), did_solve (bool)
+        """
+        model = self.model
+
+        # 1) Construir externals efectivos en t0
+        eff_ext = None
+        if externals_fn is not None:
+            out = externals_fn(float(t0), 0)
+            if not isinstance(out, dict):
+                raise TypeError("externals_fn debe devolver un dict {ext_name: {port: Tensor}}")
+            eff_ext = out
+        else:
+            eff_ext = {}
+
+        # 2) Construir un inbuf *temporal* (no tocamos self._inbuf)
+        inbuf = {n: {} for n in model.blocks.keys()}
+
+        # Usamos el wiring de inyección estricto registrado en self._ext_in:
+        #   self._ext_in: Dict[ext_name, List[(blk_name, port_can)]]
+        # Esta estructura la crea el build() del modelo/simulador.
+        if hasattr(self, "_ext_in") and isinstance(self._ext_in, dict):
+            for ext_name, targets in self._ext_in.items():
+                if ext_name not in eff_ext:
+                    raise KeyError(f"Falta entrada externa '{ext_name}'. Esperadas: {model.required_externals()}")
+                src_dict = eff_ext[ext_name]
+                for (blk_name, port_can) in targets:
+                    blk = model.blocks[blk_name]
+                    if port_can in src_dict:
+                        ten = src_dict[port_can]
+                    else:
+                        # Estricto: no aceptamos alias aquí (el usuario debe mandar el canónico)
+                        accepted = [port_can]
+                        raise KeyError(
+                            f"External '{ext_name}': falta la clave '{port_can}'. "
+                            f"Claves aceptadas para ese destino: {accepted}. "
+                            f"Claves disponibles: {sorted(list(src_dict.keys()))}"
+                        )
+                    inbuf[blk_name][port_can] = ten
+        else:
+            # Si no hay wiring de externals, no inyectamos nada
+            pass
+
+        # 3) Ensamblar residual global; NO dependemos de self.states si no existen
+        residual, detail = model.build_residual(t0, states=None, inbuf=inbuf)
+        # Normas por batch (usar mismas utilidades que en build_residual)
+        if residual.ndim == 1:
+            residual = residual.view(1, -1)
+        rn = torch.sqrt(torch.sum(residual * residual, dim=1) + 1e-16)  # (B,)
+
+        # 4) MVP: no hay z explícito. Mantener interfaz preparada:
+        z_dim = 0
+        did_solve = False
+        if z_dim > 0 and solver is not None and float(rn.max()) > tol:
+            # Esqueleto de llamada (cuando tengas z):
+            #   def Fz(z): return model.build_residual(t0, states=None, inbuf=inbuf, z=z)[0]
+            #   z0 = torch.zeros((residual.shape[0], z_dim), device=residual.device, dtype=residual.dtype)
+            #   z_star = solver.solve(Fz, z0)
+            #   did_solve = True
+            pass
+
+        return {
+            "residual": residual,
+            "detail": detail,
+            "residual_norm": float(rn.max().detach().cpu()),
+            "B": int(residual.shape[0]) if residual.numel() > 0 else 1,
+            "z_dim": int(z_dim),
+            "did_solve": bool(did_solve),
+            "t0": float(t0),
+        }
 
     # ---------- helpers ----------
     @staticmethod

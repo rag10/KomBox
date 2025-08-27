@@ -80,6 +80,31 @@ class Model(Block):
             left, right = arrow.split("->")
             self.connect(left.strip(), right.strip())
         return self
+    
+    # ---------------- azúcar para externals ----------------
+    def bind_external(self, name: str, to):
+        """
+        Conecta una entrada externa 'name' hacia uno o varios destinos 'blk.port'.
+        Equivalente a: connect(name, "blk.port")
+        """
+        if isinstance(to, (list, tuple)):
+            for dst in to:
+                self.connect(name, dst)
+        else:
+            self.connect(name, to)
+        return self
+
+    def expose(self, name: str, from_):
+        """
+        Expone como salida externa 'name' una salida 'blk.port' interna (o varias).
+        Equivalente a: connect("blk.port", name)
+        """
+        if isinstance(from_, (list, tuple)):
+            for src in from_:
+                self.connect(src, name)
+        else:
+            self.connect(from_, name)
+        return self    
 
     # ---------------- build (normaliza alias, ordena fases, externos) ----------------
     @torch.no_grad()
@@ -93,6 +118,9 @@ class Model(Block):
         dtype = torch.float32
         B = 1
         st = blk.init_state(B, device=device, dtype=dtype)
+        if not blk.out_specs or not hasattr(blk, "_expose_outputs"):
+            self._feedthrough_cache[name] = False
+            return False
         if not blk.in_specs:
             self._feedthrough_cache[name] = False
             return False
