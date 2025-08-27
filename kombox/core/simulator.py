@@ -28,22 +28,24 @@ class Simulator:
     ):
         if not model._built:
             raise RuntimeError("Simulator: Model.build() debe llamarse antes.")
-        if not model.has_states:
-            raise RuntimeError("Simulator: el Model no tiene estados. Llama a model.initialize(...).")
-
         self.model = model
         self.solver = solver if solver is not None else auto_solver_for(model)
         self._last_dt: float | None = None
         self.validate_io = bool(validate_io)
         self.strict_numerics = bool(strict_numerics)
 
-        any_state = next(iter(self.model.states.values()))
-        if any_state.ndim != 2:
-            raise ValueError(f"Simulator: cada estado debe ser 2D (B,S), recibido {tuple(any_state.shape)}.")
-
-        self._B = int(any_state.shape[0])
-        self._device = any_state.device
-        self._dtype = any_state.dtype
+        if model.has_states:
+            any_state = next(iter(self.model.states.values()))
+            if any_state.ndim != 2:
+                raise ValueError(f"Simulator: cada estado debe ser 2D (B,S), recibido {tuple(any_state.shape)}.")
+            self._B = int(any_state.shape[0])
+            self._device = any_state.device
+            self._dtype = any_state.dtype
+        else:
+            # Permite flujos puramente algebraicos (initialize_consistent) sin initialize()
+            self._B = 0
+            self._device = torch.device("cpu")
+            self._dtype = torch.float32
 
         self.t: float = 0.0
         self.k: int = 0
@@ -80,83 +82,113 @@ class Simulator:
         max_iter: int = 20,
     ):
         """
-        MVP de inicialización consistente de DAEs.
-
-        - Construye el buffer de entradas (inbuf) con las *externals* en t0.
-        - Ensambla el residual global con model.build_residual(t0, states=None, inbuf=inbuf).
-        - Si hay variables algebraicas 'z' (MVP: z_dim=0), intentaría resolver F(z)=0 con 'solver'.
-        En este MVP no definimos z explícitamente, por lo que solo comprobamos el residual.
-        - No modifica estados; devuelve info diagnóstica.
-
-        Retorna:
-        dict con claves: residual (Tensor BxR), residual_norm (float),
-                        detail (dict), B (int), z_dim (int), did_solve (bool)
+        Inicialización consistente con soporte de z global:
+        - Construye inbuf en t0 con externals.
+        - Ensambla residual global R(t0, states=None, inbuf, z).
+        - Si hay z (model._z_dim > 0), resuelve F(z)=0 con solver (NewtonKrylov por defecto).
+        No modifica estados. Devuelve info diagnóstica.
         """
         model = self.model
 
-        # 1) Construir externals efectivos en t0
-        eff_ext = None
+        # 1) Externals efectivos en t0
+        eff_ext = {}
         if externals_fn is not None:
             out = externals_fn(float(t0), 0)
             if not isinstance(out, dict):
                 raise TypeError("externals_fn debe devolver un dict {ext_name: {port: Tensor}}")
             eff_ext = out
-        else:
-            eff_ext = {}
 
-        # 2) Construir un inbuf *temporal* (no tocamos self._inbuf)
+        # 2) inbuf temporal a partir del wiring de externals
         inbuf = {n: {} for n in model.blocks.keys()}
-
-        # Usamos el wiring de inyección estricto registrado en self._ext_in:
-        #   self._ext_in: Dict[ext_name, List[(blk_name, port_can)]]
-        # Esta estructura la crea el build() del modelo/simulador.
-        if hasattr(self, "_ext_in") and isinstance(self._ext_in, dict):
+        if hasattr(self, "_ext_in") and isinstance(self._ext_in, dict) and len(self._ext_in) > 0:
             for ext_name, targets in self._ext_in.items():
                 if ext_name not in eff_ext:
                     raise KeyError(f"Falta entrada externa '{ext_name}'. Esperadas: {model.required_externals()}")
                 src_dict = eff_ext[ext_name]
                 for (blk_name, port_can) in targets:
-                    blk = model.blocks[blk_name]
-                    if port_can in src_dict:
-                        ten = src_dict[port_can]
-                    else:
-                        # Estricto: no aceptamos alias aquí (el usuario debe mandar el canónico)
-                        accepted = [port_can]
+                    if port_can not in src_dict:
                         raise KeyError(
                             f"External '{ext_name}': falta la clave '{port_can}'. "
-                            f"Claves aceptadas para ese destino: {accepted}. "
                             f"Claves disponibles: {sorted(list(src_dict.keys()))}"
                         )
-                    inbuf[blk_name][port_can] = ten
+                    inbuf[blk_name][port_can] = src_dict[port_can]
+
+        # Compatibilidad: permitir que constraints lean externals por grupo si no hay wiring
+        for grp, ports in eff_ext.items():
+            if grp not in model.blocks:
+                inbuf[grp] = dict(ports)
+
+        # 3) Inferir B/device/dtype desde inbuf (sin depender del residual)
+        B, device, dtype = None, torch.device("cpu"), torch.float32
+        found_t = None
+        for bd in inbuf.values():
+            for ten in bd.values():
+                if isinstance(ten, torch.Tensor) and ten.numel() > 0:
+                    found_t = ten
+                    break
+            if found_t is not None:
+                break
+        if found_t is not None:
+            B = int(found_t.shape[0])
+            device = found_t.device
+            dtype = found_t.dtype
         else:
-            # Si no hay wiring de externals, no inyectamos nada
-            pass
+            B = 1  # por defecto si no hay tensores en inbuf
 
-        # 3) Ensamblar residual global; NO dependemos de self.states si no existen
-        residual, detail = model.build_residual(t0, states=None, inbuf=inbuf)
-        # Normas por batch (usar mismas utilidades que en build_residual)
-        if residual.ndim == 1:
-            residual = residual.view(1, -1)
-        rn = torch.sqrt(torch.sum(residual * residual, dim=1) + 1e-16)  # (B,)
+        # 4) Si hay z declarado, crear z0 de ceros para el residual inicial
+        z_dim = int(getattr(model, "_z_dim", 0) or 0)
+        z0 = None
+        if z_dim > 0:
+            z0 = torch.zeros((B, z_dim), dtype=dtype, device=device)
 
-        # 4) MVP: no hay z explícito. Mantener interfaz preparada:
-        z_dim = 0
+        # 5) Residual inicial (con z0 si procede)
+        residual0, detail0 = model.build_residual(t0, states=None, inbuf=inbuf, z=z0)
+        if residual0.ndim == 1:
+            residual0 = residual0.view(1, -1)
+        rn0 = torch.sqrt(torch.sum(residual0 * residual0, dim=1) + 1e-16)  # (B,)
+
+        # 6) Resolver Z si procede
         did_solve = False
-        if z_dim > 0 and solver is not None and float(rn.max()) > tol:
-            # Esqueleto de llamada (cuando tengas z):
-            #   def Fz(z): return model.build_residual(t0, states=None, inbuf=inbuf, z=z)[0]
-            #   z0 = torch.zeros((residual.shape[0], z_dim), device=residual.device, dtype=residual.dtype)
-            #   z_star = solver.solve(Fz, z0)
-            #   did_solve = True
-            pass
+        z_star = None
+        if z_dim > 0:
+            if solver is None:
+                from ..core.algebraic.newton_krylov import NewtonKrylov
+                solver = NewtonKrylov(mode="jfnk", max_iter=max_iter, tol=tol)
 
+            def Fz(z):
+                r = model.build_residual(t0, states=None, inbuf=inbuf, z=z)
+                if isinstance(r, tuple):
+                    r = r[0]
+                return r
+
+            z_star = solver.solve(Fz, z0)  # parte de z0 (ceros)
+            did_solve = True
+
+            residual1, detail1 = model.build_residual(t0, states=None, inbuf=inbuf, z=z_star)
+            if residual1.ndim == 1:
+                residual1 = residual1.view(1, -1)
+            rn1 = torch.sqrt(torch.sum(residual1 * residual1, dim=1) + 1e-16)
+            return {
+                "residual": residual1,
+                "detail": detail1,
+                "residual_norm": float(rn1.max().detach().cpu()),
+                "residual_norm_before": float(rn0.max().detach().cpu()),
+                "B": B,
+                "z_dim": z_dim,
+                "z_star": z_star.detach(),
+                "did_solve": did_solve,
+                "t0": float(t0),
+            }
+
+        # 7) Sin z: devolvemos residual inicial
         return {
-            "residual": residual,
-            "detail": detail,
-            "residual_norm": float(rn.max().detach().cpu()),
-            "B": int(residual.shape[0]) if residual.numel() > 0 else 1,
-            "z_dim": int(z_dim),
-            "did_solve": bool(did_solve),
+            "residual": residual0,
+            "detail": detail0,
+            "residual_norm": float(rn0.max().detach().cpu()),
+            "B": B,
+            "z_dim": 0,
+            "z_star": None,
+            "did_solve": False,
             "t0": float(t0),
         }
 
@@ -221,6 +253,12 @@ class Simulator:
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         ext_from_fn = externals_fn(self.t, self.k) if externals_fn is not None else None
         eff_ext = self._merge_two_level(externals, ext_from_fn)
+        
+        if not self.model.has_states:
+            raise RuntimeError(
+                "Simulator.step requiere que el modelo tenga estados inicializados. "
+                "Usa model.initialize(...) antes. Para DAEs puramente algebraicas, usa initialize_consistent()."
+            )
 
         # si el modelo tiene lazos algebraicos y el solver no es global/implícito, abortar aquí
         if getattr(self.model, "_has_pure_algebraic_cycle", False):
@@ -327,6 +365,12 @@ class Simulator:
         Ejecuta un bucle de simulación. Si 'progress=True', imprime (o envía a 'progress_fn')
         una línea de estado cada ~progress_interval segundos de reloj.
         """
+        if not self.model.has_states:
+            raise RuntimeError(
+                "Simulator.simulate requiere estados inicializados. "
+                "Usa model.initialize(...). Para inicialización algebraica, usa initialize_consistent()."
+            )
+
         if (total_time is None) == (steps is None):
             raise ValueError("Especifica exactamente uno: steps o total_time.")
         if steps is None:

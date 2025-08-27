@@ -54,7 +54,7 @@ class Model(Block):
 
         self._has_pure_algebraic_cycle = False
         self._algebraic_cycles = []  # lista de ciclos detectados (por nombres de bloque)
-
+        self._z_dim = 0
 # ---------------- estructura ----------------
     def add_block(self, name: str, block: Block):
         if name in self.blocks:
@@ -442,6 +442,13 @@ class Model(Block):
         if len(pieces) == 0:
             return torch.zeros((B, 0), dtype=torch.float32), detail
         return torch.cat(pieces, dim=1), detail
+
+    def declare_algebraic_dim(self, dim: int):
+        """Declara la dimensión global de las variables algebraicas z (B, dim)."""
+        if dim < 0:
+            raise ValueError("Algebraic dim must be >= 0")
+        self._z_dim = int(dim)
+        return self
 
     def analyze_topology(self):
         g = FeedthroughGraph()
