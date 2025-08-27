@@ -1,6 +1,6 @@
 # kombox/core/simulator.py
 # from __future__ import annotations
-from typing import Dict, Mapping, Optional, Callable
+from typing import Dict, Mapping, Optional, Callable, Tuple, List
 
 import torch
 
@@ -12,6 +12,52 @@ from .block import Block
 from .solvers import SolverBase, EulerSolver, auto_solver_for
 
 
+def _flatten_states(states: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, List[Tuple[str, slice, Tuple[int,int]]]]:
+    """Concatena todos los estados (B,S_i) por columnas → (B, S_total). Devuelve tensor y metainfo."""
+    if len(states) == 0:
+        return torch.empty((1,0), dtype=torch.float32), []
+    B = None
+    metas: List[Tuple[str, slice, Tuple[int,int]]] = []
+    cols = []
+    col_start = 0
+    for name, X in states.items():
+        if X is None:
+            continue
+        if B is None:
+            B = X.shape[0]
+        S = X.shape[1] if X.ndim == 2 else 0
+        if S == 0:
+            continue
+        cols.append(X)
+        metas.append((name, slice(col_start, col_start + S), (B, S)))
+        col_start += S
+    if len(cols) == 0:
+        return torch.empty((B if B is not None else 1, 0), dtype=list(states.values())[0].dtype if states else torch.float32, device=list(states.values())[0].device if states else torch.device("cpu")), metas
+    Xall = torch.cat(cols, dim=1)
+    return Xall, metas
+
+def _unflatten_states(Xall: torch.Tensor, metas: List[Tuple[str, slice, Tuple[int,int]]], proto: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Reconstruye el dict de estados a partir de Xall y las metas; conserva device/dtype por tensor."""
+    out: Dict[str, torch.Tensor] = {}
+    for name in proto.keys():
+        out[name] = proto[name]  # por defecto, mantener referencias
+    for name, slc, (B, S) in metas:
+        out[name] = Xall[:, slc]
+    return out
+
+def _collect_global_constraints(model, t: float, states: Dict[str, torch.Tensor], inbuf: Dict[str, Dict[str, torch.Tensor]], z: torch.Tensor = None) -> torch.Tensor:
+    """Devuelve solo las restricciones globales g(x,...) concatenadas (B, Rg). Si no hay, retorna (B,0)."""
+    r, detail = model.build_residual(t, states=states, inbuf=inbuf, z=z)
+    # filtra claves globales: usan el prefijo "__global__::"
+    pieces = []
+    B = r.shape[0] if r.ndim == 2 else 1
+    for k, v in detail.items():
+        if isinstance(k, str) and k.startswith("__global__::"):
+            vv = v if v.ndim == 2 else v.view(B, -1)
+            pieces.append(vv)
+    if len(pieces) == 0:
+        return torch.zeros((B, 0), dtype=r.dtype, device=r.device)
+    return torch.cat(pieces, dim=1)
 
 class Simulator:
     """
@@ -59,6 +105,12 @@ class Simulator:
         self._orderA = self.model._order_outputs
         self._ext_in = self.model._ext_in
         self._ext_out = self.model._ext_out
+
+        # proyección pos-paso para restricciones globales
+        self._proj_enabled = False
+        self._proj_tol = 1e-8
+        self._proj_maxit = 5
+        self._proj_damping = 1e-8
 
     # ---------- atajos ----------
     @property
@@ -191,6 +243,75 @@ class Simulator:
             "did_solve": False,
             "t0": float(t0),
         }
+    
+    def enable_constraint_projection(self, enabled: bool = True, tol: float = 1e-8, max_iter: int = 5, damping: float = 1e-8):
+        """Activa/desactiva proyección pos-paso para g(x)=0."""
+        self._proj_enabled = bool(enabled)
+        self._proj_tol = float(tol)
+        self._proj_maxit = int(max_iter)
+        self._proj_damping = float(damping)
+        return self
+
+    def _project_states_once(self, states: Dict[str, torch.Tensor], inbuf: Dict[str, Dict[str, torch.Tensor]], t: float) -> Dict[str, torch.Tensor]:
+        """Un paso LM: resuelve min||δx|| s.t. g(x+δx)=0 ≈ línea: (Jg) δx = -g; dx = argmin || (Jg) dx + g ||_2 + λ||dx||."""
+        # 1) Aplanar
+        Xall, metas = _flatten_states(states)
+        if Xall.shape[1] == 0:
+            return states  # nada que proyectar si no hay estados
+        Xall = Xall.clone().requires_grad_(True)
+
+        # 2) Define g(X) como solo restricciones globales
+        def g_only(Xflat: torch.Tensor) -> torch.Tensor:
+            st = _unflatten_states(Xflat, metas, states)
+            g = _collect_global_constraints(self.model, t, st, inbuf, z=None)  # z no participa aquí
+            # g: (B, Rg)
+            return g
+
+        # 3) Evalúa g y Jacobiano por batch
+        g = g_only(Xall)  # (B,Rg)
+        B = g.shape[0]
+        Rg = g.shape[1] if g.ndim == 2 else 0
+        if Rg == 0:
+            return states  # no hay restricciones globales
+
+        # --- NUEVO: jacobiano batcheado sin in-place ---
+        # J tiene forma (B, Rg, B, S). Para cada batch b, nos quedamos con J[b, :, b, :].
+        J_full = torch.autograd.functional.jacobian(g_only, Xall, create_graph=True)  # (B,Rg,B,S)
+        # Seguridad: algunas versiones devuelven (Rg,B,S,...) — aquí asumimos (B,Rg,B,S).
+        assert J_full.ndim == 4, f"jacobian shape inesperada: {tuple(J_full.shape)}"
+
+        # 4) Resuelve normales con damping (Levenberg)
+        S = Xall.shape[1]
+        eyeS = torch.eye(S, device=Xall.device, dtype=Xall.dtype)
+        Xnew = []
+        for b in range(B):
+            gb = g[b].reshape(-1, 1)                 # (Rg,1)
+            Jb = J_full[b, :, b, :]                  # (Rg,S)
+            AtA = Jb.T @ Jb + self._proj_damping * eyeS  # (S,S)
+            rhs = - Jb.T @ gb                        # (S,1)
+            dx = torch.linalg.solve(AtA, rhs).view(1, S)  # (1,S)
+            Xnew.append(Xall[b:b+1] + dx)
+
+        Xupd = torch.cat(Xnew, dim=0)  # (B,S)
+
+        # 5) Reconstruir dict
+        st_new = _unflatten_states(Xupd, metas, states)
+        return st_new
+
+    def _project_states(self, states: Dict[str, torch.Tensor], inbuf: Dict[str, Dict[str, torch.Tensor]], t: float) -> Dict[str, torch.Tensor]:
+        """Itera _project_states_once hasta tolerancia o max_iter."""
+        if not getattr(self, "_proj_enabled", False):
+            return states
+        st = states
+        for _ in range(getattr(self, "_proj_maxit", 5)):
+            g = _collect_global_constraints(self.model, t, st, inbuf, z=None)
+            if g.shape[1] == 0:
+                break
+            rn = torch.sqrt(torch.sum(g * g, dim=1) + 1e-16).max()
+            if float(rn) < getattr(self, "_proj_tol", 1e-8):
+                break
+            st = self._project_states_once(st, inbuf, t)
+        return st
 
     # ---------- helpers ----------
     @staticmethod
@@ -205,7 +326,7 @@ class Simulator:
             for n, d in over.items():
                 out.setdefault(n, {}); out[n].update(d)
         return out
-
+    
     def _inject_externals(self, eff_ext: Mapping[str, Mapping[str, torch.Tensor]]):
         # Limpia buffers
         for d in self._inbuf.values():
@@ -253,6 +374,7 @@ class Simulator:
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         ext_from_fn = externals_fn(self.t, self.k) if externals_fn is not None else None
         eff_ext = self._merge_two_level(externals, ext_from_fn)
+        t0 = self.t
         
         if not self.model.has_states:
             raise RuntimeError(
@@ -287,6 +409,8 @@ class Simulator:
             self._last_dt = float(dt)
             new_states, outs_end = self.solver.step_all(self.model, self.states, float(dt), self.t,
                                                         externals_time_fn=ext_time_fn)
+            # Proyección pos-paso (si hay restricciones globales y está activada)
+            new_states = self._project_states(new_states, self._inbuf, t0 + dt)
 
             # Validaciones y escritura de estados
             if self.validate_io:
@@ -338,6 +462,8 @@ class Simulator:
             new_states[bname] = new_st
             self._outs_cache[bname] = outs2
 
+        # Proyección pos-paso también para la ruta no-global
+        new_states = self._project_states(new_states, self._inbuf, t0 + dt)
         # Actualiza estados en el propio modelo
         self.model.set_states(new_states, validate_shapes=False)
 
