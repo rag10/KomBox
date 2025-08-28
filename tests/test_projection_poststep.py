@@ -61,3 +61,5 @@ def test_projection_clamps_state_to_constraint():
 
     # Con proyección: x ≈ 0 (se clampa por la restricción global)
     assert torch.allclose(x_proj, torch.zeros_like(x_proj), atol=1e-6), f"x_proj={x_proj}"
+    r,_ = m2.build_residual(sim2.t, states=m2.states, inbuf=sim2._inbuf)
+    assert torch.allclose(r.abs().max(), torch.tensor(0.0), atol=1e-6)

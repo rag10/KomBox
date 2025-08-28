@@ -111,6 +111,10 @@ class Simulator:
         self._proj_tol = 1e-8
         self._proj_maxit = 5
         self._proj_damping = 1e-8
+        # heurística JVP/VJP + CG para estados grandes
+        self._proj_cg_threshold = 512     # cambia si quieres
+        self._proj_cg_maxit = 50
+        self._proj_cg_tol = 1e-10
 
     # ---------- atajos ----------
     @property
@@ -244,57 +248,152 @@ class Simulator:
             "t0": float(t0),
         }
     
-    def enable_constraint_projection(self, enabled: bool = True, tol: float = 1e-8, max_iter: int = 5, damping: float = 1e-8):
+    def enable_constraint_projection(
+            self,
+            enabled: bool = True,
+            tol: float = 1e-8, 
+            max_iter: int = 5, 
+            damping: float = 1e-8,
+            proj_cg_threshold:int = 512,
+            proj_cg_maxit: int = 50,
+            proj_cg_tol: float = 1e-10,           
+        ):
         """Activa/desactiva proyección pos-paso para g(x)=0."""
         self._proj_enabled = bool(enabled)
         self._proj_tol = float(tol)
         self._proj_maxit = int(max_iter)
         self._proj_damping = float(damping)
+        self._proj_cg_threshold = int(proj_cg_threshold)
+        self._proj_cg_maxit = int(proj_cg_maxit)
+        self._proj_cg_tol = float(proj_cg_tol)
         return self
 
     def _project_states_once(self, states: Dict[str, torch.Tensor], inbuf: Dict[str, Dict[str, torch.Tensor]], t: float) -> Dict[str, torch.Tensor]:
-        """Un paso LM: resuelve min||δx|| s.t. g(x+δx)=0 ≈ línea: (Jg) δx = -g; dx = argmin || (Jg) dx + g ||_2 + λ||dx||."""
         # 1) Aplanar
         Xall, metas = _flatten_states(states)
         if Xall.shape[1] == 0:
-            return states  # nada que proyectar si no hay estados
+            return states
         Xall = Xall.clone().requires_grad_(True)
 
-        # 2) Define g(X) como solo restricciones globales
+        # 2) g(X): solo restricciones globales
         def g_only(Xflat: torch.Tensor) -> torch.Tensor:
             st = _unflatten_states(Xflat, metas, states)
-            g = _collect_global_constraints(self.model, t, st, inbuf, z=None)  # z no participa aquí
-            # g: (B, Rg)
-            return g
+            return _collect_global_constraints(self.model, t, st, inbuf, z=None)  # (B,Rg)
 
-        # 3) Evalúa g y Jacobiano por batch
         g = g_only(Xall)  # (B,Rg)
         B = g.shape[0]
         Rg = g.shape[1] if g.ndim == 2 else 0
         if Rg == 0:
-            return states  # no hay restricciones globales
+            return states
 
-        # --- NUEVO: jacobiano batcheado sin in-place ---
-        # J tiene forma (B, Rg, B, S). Para cada batch b, nos quedamos con J[b, :, b, :].
-        J_full = torch.autograd.functional.jacobian(g_only, Xall, create_graph=True)  # (B,Rg,B,S)
-        # Seguridad: algunas versiones devuelven (Rg,B,S,...) — aquí asumimos (B,Rg,B,S).
-        assert J_full.ndim == 4, f"jacobian shape inesperada: {tuple(J_full.shape)}"
-
-        # 4) Resuelve normales con damping (Levenberg)
         S = Xall.shape[1]
-        eyeS = torch.eye(S, device=Xall.device, dtype=Xall.dtype)
-        Xnew = []
-        for b in range(B):
-            gb = g[b].reshape(-1, 1)                 # (Rg,1)
-            Jb = J_full[b, :, b, :]                  # (Rg,S)
-            AtA = Jb.T @ Jb + self._proj_damping * eyeS  # (S,S)
-            rhs = - Jb.T @ gb                        # (S,1)
-            dx = torch.linalg.solve(AtA, rhs).view(1, S)  # (1,S)
-            Xnew.append(Xall[b:b+1] + dx)
+        use_cg = S >= getattr(self, "_proj_cg_threshold", 512)
 
-        Xupd = torch.cat(Xnew, dim=0)  # (B,S)
+        Xupd_rows = []
+        if not use_cg:
+            # ---- Modo DENSO (forma J y resuelve normales) ----
+            J_full = torch.autograd.functional.jacobian(g_only, Xall, create_graph=True)  # (B,Rg,B,S)
+            eyeS = torch.eye(S, device=Xall.device, dtype=Xall.dtype)
+            base_lam = float(getattr(self, "_proj_damping", 0.0))  # p.ej. 1e-8
+            for b in range(B):
+                gb = g[b].reshape(-1, 1)
+                Jb = J_full[b, :, b, :]
+                rhs = - Jb.T @ gb
 
-        # 5) Reconstruir dict
+                # intento 1: lambda tal cual
+                lam = base_lam
+                AtA = Jb.T @ Jb + lam * eyeS
+                try:
+                    dx = torch.linalg.solve(AtA, rhs).view(1, S)
+                except RuntimeError:
+                    # intento 2..N: aumentar lambda
+                    success = False
+                    for fac in (10.0, 100.0, 1000.0, 1e4):
+                        lam_try = lam * fac if lam > 0.0 else 1e-8 * fac
+                        A = Jb.T @ Jb + lam_try * eyeS
+                        try:
+                            dx = torch.linalg.solve(A, rhs).view(1, S)
+                            success = True
+                            break
+                        except RuntimeError:
+                            continue
+                    if not success:
+                        # último recurso: least squares (no requiere no-singularidad)
+                        A = Jb.T @ Jb + (1e-6 if lam == 0.0 else lam) * eyeS
+                        dx = torch.linalg.lstsq(A, rhs).solution.view(1, S)
+
+                Xupd_rows.append(Xall[b:b+1] + dx)
+            Xupd = torch.cat(Xupd_rows, dim=0)
+
+        else:
+            # ---- Modo JFNK (JVP + grad en ecuaciones normales) ----
+            from torch.autograd.functional import jvp
+
+            lam = self._proj_damping
+
+            def cg_solve(applyA, bvec, tol, maxit):
+                x = torch.zeros_like(bvec)
+                r = bvec - applyA(x)
+                p = r.clone()
+                rs_old = (r @ r)
+                it = 0
+                while it < maxit and float(rs_old) > tol:
+                    Ap = applyA(p)
+                    alpha = rs_old / (p @ Ap + 1e-30)
+                    x = x + alpha * p
+                    r = r - alpha * Ap
+                    rs_new = (r @ r)
+                    beta = rs_new / (rs_old + 1e-30)
+                    p = r + beta * p
+                    rs_old = rs_new
+                    it += 1
+                return x
+
+            for b in range(B):
+                def g_b_of_X(Xflat: torch.Tensor) -> torch.Tensor:
+                    # g_b : R^S -> R^{Rg}
+                    return g_only(Xflat)[b]
+
+                # --- rhs = - J^T g ---
+                with torch.enable_grad():
+                    y = g_b_of_X(Xall)  # (Rg,)
+                    # J^T g = grad( y · g ) w.r.t. Xall  usando grad_outputs = g
+                    (JTg_full,) = torch.autograd.grad(
+                        outputs=y,
+                        inputs=Xall,
+                        grad_outputs=y,                 # = g(X) en la iteración actual
+                        create_graph=True,
+                        retain_graph=True,
+                        allow_unused=False,
+                    )
+                rhs = - JTg_full[b].reshape(-1)          # (S,)
+
+                # --- operador A v = J^T J v + lam v ---
+                def applyA(v: torch.Tensor) -> torch.Tensor:
+                    vX = torch.zeros_like(Xall)
+                    vX[b] = v.reshape(1, -1)
+                    # J v vía JVP
+                    _, Jv = jvp(g_b_of_X, (Xall,), (vX,), create_graph=True)  # (Rg,)
+                    # J^T (J v) con autograd.grad (grad_outputs=Jv)
+                    (JTJv_full,) = torch.autograd.grad(
+                        outputs=y,                      # 'y' = g_b(X) computado arriba
+                        inputs=Xall,
+                        grad_outputs=Jv,
+                        create_graph=True,
+                        retain_graph=True,
+                        allow_unused=False,
+                    )
+                    JTJv = JTJv_full[b].reshape(-1)     # (S,)
+                    return JTJv + lam * v
+
+                dx = cg_solve(applyA, rhs, tol=getattr(self, "_proj_cg_tol", 1e-10),
+                            maxit=getattr(self, "_proj_cg_maxit", 50))
+                Xupd_rows.append(Xall[b:b+1] + dx.view(1, S))
+
+
+            Xupd = torch.cat(Xupd_rows, dim=0)
+
+        # 3) Reconstruir dict
         st_new = _unflatten_states(Xupd, metas, states)
         return st_new
 
@@ -409,25 +508,76 @@ class Simulator:
             self._last_dt = float(dt)
             new_states, outs_end = self.solver.step_all(self.model, self.states, float(dt), self.t,
                                                         externals_time_fn=ext_time_fn)
-            # Proyección pos-paso (si hay restricciones globales y está activada)
-            new_states = self._project_states(new_states, self._inbuf, t0 + dt)
+            # --- Re-evaluar inbuf en t0+dt para proyección ---
+            def build_inbuf_for(states_dict, tnow):
+                # externals en tnow (mezcla base 'externals' con externals_fn si hay)
+                base = eff_ext or {}
+                over = externals_fn(tnow, self.k + 1) if externals_fn is not None else None
+                ext_map = self._merge_two_level(base, over)
 
-            # Validaciones y escritura de estados
+                # buffer temporal
+                inbuf = {n: {} for n in self.model.blocks.keys()}
+
+                # inyectar externals de forma estricta en 'inbuf'
+                for ext_name, targets in self._ext_in.items():
+                    if ext_name not in ext_map:
+                        raise KeyError(f"Falta entrada externa '{ext_name}' en t={tnow:.6f}.")
+                    src_dict = ext_map[ext_name]
+                    for (blk_name, port_can) in targets:
+                        blk = self.model.blocks[blk_name]
+                        if port_can in src_dict:
+                            ten = src_dict[port_can]
+                        else:
+                            alias_for_port = [a for (a, c) in blk._in_alias.items() if c == port_can]
+                            ten = None
+                            for a in alias_for_port:
+                                if a in src_dict:
+                                    ten = src_dict[a]; break
+                            if ten is None:
+                                accepted = [port_can] + alias_for_port
+                                raise KeyError(
+                                    f"External '{ext_name}': falta la clave '{port_can}'. "
+                                    f"Aceptadas: {accepted}. Disponibles: {sorted(list(src_dict.keys()))}"
+                                )
+                        inbuf[blk_name][port_can] = ten
+
+                # fase A con 'states_dict' en tnow (propaga salidas a entradas)
+                outs_tmp = {n: {} for n in self.model.blocks.keys()}
+                for bname in self._orderA:
+                    blk: Block = self.model.blocks[bname]
+                    ins = inbuf[bname]
+                    outs = blk._expose_outputs(states_dict[bname], ins, tnow)
+                    outs_tmp[bname] = outs
+                    for (port_name, ten) in outs.items():
+                        for (dst_blk, dst_port) in self._downstream.get((bname, port_name), []):
+                            inbuf[dst_blk][dst_port] = ten
+                return inbuf, outs_tmp
+
+            # inbuf y outs con estados nuevos en t0+dt
+            inbuf_final, outs_final_pre = build_inbuf_for(new_states, t0 + dt)
+
+            # Proyección pos-paso (si hay restricciones globales y está activada)
+            proj_states = self._project_states(new_states, inbuf_final, t0 + dt)
+
+            # Recalcular outs con estados proyectados (coherencia)
+            inbuf_final, outs_final = build_inbuf_for(proj_states, t0 + dt)
+
+            # Validaciones / numerics
             if self.validate_io:
                 for bname, blk in self.model.blocks.items():
-                    blk._validate_outputs(outs_end[bname], batch_size=self.B)
+                    blk._validate_outputs(outs_final[bname], batch_size=self.B)
             if self.strict_numerics:
-                for bname, st in new_states.items():
+                for bname, st in proj_states.items():
                     if st.numel()>0 and not torch.isfinite(st).all():
                         raise FloatingPointError(f"{bname}.state: NaN/Inf.")
-                for bname, outs in outs_end.items():
+                for bname, outs in outs_final.items():
                     for pname, ten in outs.items():
                         if not torch.isfinite(ten).all():
                             raise FloatingPointError(f"{bname}.{pname}: NaN/Inf.")
 
             # aplicar
-            self.model.set_states(new_states, validate_shapes=False)
-            self._outs_cache = outs_end
+            self.model.set_states(proj_states, validate_shapes=False)
+            self._outs_cache = outs_final
             self.k += 1; self.t += float(dt)
             return self._outs_cache
 
@@ -462,11 +612,57 @@ class Simulator:
             new_states[bname] = new_st
             self._outs_cache[bname] = outs2
 
+        # --- Re-evaluar inbuf a t0+dt para proyección ---
+        def build_inbuf_for(states_dict, tnow):
+            base = externals or {}
+            over = externals_fn(tnow, self.k + 1) if externals_fn is not None else None
+            ext_map = self._merge_two_level(base, over)
+
+            inbuf = {n: {} for n in self.model.blocks.keys()}
+            for ext_name, targets in self._ext_in.items():
+                if ext_name not in ext_map:
+                    raise KeyError(f"Falta entrada externa '{ext_name}' en t={tnow:.6f}.")
+                src_dict = ext_map[ext_name]
+                for (blk_name, port_can) in targets:
+                    blk = self.model.blocks[blk_name]
+                    if port_can in src_dict:
+                        ten = src_dict[port_can]
+                    else:
+                        alias_for_port = [a for (a, c) in blk._in_alias.items() if c == port_can]
+                        ten = None
+                        for a in alias_for_port:
+                            if a in src_dict:
+                                ten = src_dict[a]; break
+                        if ten is None:
+                            accepted = [port_can] + alias_for_port
+                            raise KeyError(
+                                f"External '{ext_name}': falta la clave '{port_can}'. "
+                                f"Aceptadas: {accepted}. Disponibles: {sorted(list(src_dict.keys()))}"
+                            )
+                    inbuf[blk_name][port_can] = ten
+
+            outs_tmp = {n: {} for n in self.model.blocks.keys()}
+            for bname in self._orderA:
+                blk: Block = self.model.blocks[bname]
+                ins = inbuf[bname]
+                outs = blk._expose_outputs(states_dict[bname], ins, tnow)
+                outs_tmp[bname] = outs
+                for (port_name, ten) in outs.items():
+                    for (dst_blk, dst_port) in self._downstream.get((bname, port_name), []):
+                        inbuf[dst_blk][dst_port] = ten
+            return inbuf, outs_tmp
+
+        inbuf_final, _ = build_inbuf_for(new_states, t0 + dt)
+        proj_states = self._project_states(new_states, inbuf_final, t0 + dt)
+
+        # Recalcular salidas con estados proyectados
+        inbuf_final, outs_final = build_inbuf_for(proj_states, t0 + dt)
+
         # Proyección pos-paso también para la ruta no-global
         new_states = self._project_states(new_states, self._inbuf, t0 + dt)
-        # Actualiza estados en el propio modelo
-        self.model.set_states(new_states, validate_shapes=False)
-
+        # Actualiza estados y outs coherentes con la proyección
+        self.model.set_states(proj_states, validate_shapes=False)
+        self._outs_cache = outs_final
         self.k += 1
         self.t += float(dt)
         return self._outs_cache
