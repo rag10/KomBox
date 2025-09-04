@@ -249,24 +249,26 @@ class Simulator:
         }
     
     def enable_constraint_projection(
-            self,
-            enabled: bool = True,
-            tol: float = 1e-8, 
-            max_iter: int = 5, 
-            damping: float = 1e-8,
-            proj_cg_threshold:int = 512,
-            proj_cg_maxit: int = 50,
-            proj_cg_tol: float = 1e-10,           
-        ):
-        """Activa/desactiva proyección pos-paso para g(x)=0."""
+        self,
+        enabled: bool,
+        *,
+        tol: float = 1e-9,
+        max_iter: int = 5,
+        damping: float = 1e-8,
+        every_n_steps: int = 1,
+        cg_threshold: int = 512,
+        cg_tol: float = 1e-12,
+        cg_maxit: int = 200,
+    ):
+        """Activa proyección pos-paso opcional (cada N pasos)."""
         self._proj_enabled = bool(enabled)
         self._proj_tol = float(tol)
-        self._proj_maxit = int(max_iter)
+        self._proj_max_iter = int(max_iter)
         self._proj_damping = float(damping)
-        self._proj_cg_threshold = int(proj_cg_threshold)
-        self._proj_cg_maxit = int(proj_cg_maxit)
-        self._proj_cg_tol = float(proj_cg_tol)
-        return self
+        self._proj_every_n = max(1, int(every_n_steps))
+        self._proj_cg_threshold = int(cg_threshold)
+        self._proj_cg_tol = float(cg_tol)
+        self._proj_cg_maxit = int(cg_maxit)
 
     def _project_states_once(self, states: Dict[str, torch.Tensor], inbuf: Dict[str, Dict[str, torch.Tensor]], t: float) -> Dict[str, torch.Tensor]:
         # 1) Aplanar
@@ -463,6 +465,46 @@ class Simulator:
 
                 self._inbuf[blk_name][port_can] = ten
 
+    def _inject_externals_into(self, inbuf: Dict[str, Dict[str, torch.Tensor]],
+                               eff_ext: Mapping[str, Mapping[str, torch.Tensor]]):
+        """
+        Inyecta externals 'eff_ext' de manera estricta en el buffer 'inbuf' pasado
+        (no usa self._inbuf). Respeta alias de entrada definidos en cada bloque.
+        Formato: eff_ext = { ext_name: {port: tensor, ...}, ... }
+        """
+        # Asegura que existen las claves de todos los bloques en el buffer destino
+        for n in self.model.blocks.keys():
+            inbuf.setdefault(n, {})
+
+        for ext_name, targets in self._ext_in.items():
+            if ext_name not in eff_ext:
+                raise KeyError(
+                    f"Falta entrada externa '{ext_name}'. "
+                    f"Esperadas: {self.model.required_externals()}"
+                )
+
+            src_dict = eff_ext[ext_name]
+
+            for (blk_name, port_can) in targets:
+                blk = self.model.blocks[blk_name]
+
+                # 1) nombre canónico
+                if port_can in src_dict:
+                    ten = src_dict[port_can]
+                else:
+                    # 2) alias -> canónico
+                    alias_for_port = [a for (a, c) in blk._in_alias.items() if c == port_can]
+                    ten = None
+                    for a in alias_for_port:
+                        if a in src_dict:
+                            ten = src_dict[a]
+                            break
+                    if ten is None:
+                        accepted = [port_can] + alias_for_port
+                        raise KeyError(f"External '{ext_name}': falta la clave '{port_can}'. "
+                                       f"Aceptadas: {accepted}. Disponibles: {sorted(list(src_dict.keys()))}")
+                inbuf[blk_name][port_can] = ten
+
     # ---------- un paso ----------
     def step(
         self,
@@ -496,18 +538,14 @@ class Simulator:
         if getattr(self.solver, "is_global", False):
             # construir función de externals dependiente de t para los subpasos internos
             def ext_time_fn(tnow: float):
-                # mezcla externals "fijos" (eff_ext) con externals_fn(tnow, k_est)
-                base = eff_ext or {}
-                over = None
-                if externals_fn is not None:
-                    # k estimado a partir de t y último dt (no crítico; mayoría de externals solo dependen de t)
-                    k_est = int(round((tnow - (self.t - (self._last_dt or 0.0))) / (self._last_dt or 1.0))) if self._last_dt else self.k
-                    over = externals_fn(tnow, k_est)
+                base = externals or {}
+                over = externals_fn(tnow, self.k) if externals_fn is not None else None
                 return self._merge_two_level(base, over)
 
             self._last_dt = float(dt)
             new_states, outs_end = self.solver.step_all(self.model, self.states, float(dt), self.t,
                                                         externals_time_fn=ext_time_fn)
+
             # --- Re-evaluar inbuf en t0+dt para proyección ---
             def build_inbuf_for(states_dict, tnow):
                 # externals en tnow (mezcla base 'externals' con externals_fn si hay)
@@ -553,13 +591,22 @@ class Simulator:
                             inbuf[dst_blk][dst_port] = ten
                 return inbuf, outs_tmp
 
-            # inbuf y outs con estados nuevos en t0+dt
+            # inbuf/outs con estados nuevos en t0+dt (antes de proyección)
             inbuf_final, outs_final_pre = build_inbuf_for(new_states, t0 + dt)
+            proj_states = new_states  # por defecto, si no hay proyección
 
-            # Proyección pos-paso (si hay restricciones globales y está activada)
-            proj_states = self._project_states(new_states, inbuf_final, t0 + dt)
+            # --- Proyección pos-paso opcional --- #
+            do_proj = getattr(self, "_proj_enabled", False) and (((self.k + 1) % getattr(self, "_proj_every_n", 1)) == 0)
+            if do_proj:
+                # re-eval externals en t+dt para proyectar con entradas finales
+                inbuf_for_proj: Dict[str, Dict[str, torch.Tensor]] = {n: {} for n in self.model.blocks.keys()}
+                if externals_fn is not None:
+                    eff_ext_t1 = externals_fn(self.t + dt, self.k + 1) or {}
+                    self._inject_externals_into(inbuf_for_proj, eff_ext_t1)
+                self._outs_cache = outs_end
+                proj_states = self._project_states(new_states, inbuf_for_proj, self.t + dt)
 
-            # Recalcular outs con estados proyectados (coherencia)
+            # Recalcular inbuf/outs con estados finales coherentes (proyectados o no)
             inbuf_final, outs_final = build_inbuf_for(proj_states, t0 + dt)
 
             # Validaciones / numerics

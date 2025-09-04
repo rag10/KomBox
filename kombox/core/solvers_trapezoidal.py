@@ -6,13 +6,16 @@ from .solvers import SolverBase
 from .simulator import _flatten_states, _unflatten_states, _collect_global_constraints
 from .algebraic.newton_krylov import NewtonKrylov  # import correcto
 
+_ALLOWED_MODES = {"kkt", "kkt_baumgarte"}
+
 class TrapezoidalSolver(SolverBase):
     """
-    Stepper implícito tipo Trapecio (global):
-    - Fase A: wiring en t y t+dt para estimar entradas.
-    - Integra continuos por-bloque con predictor-corrector trapecial.
-    - Resuelve el residual algebraico global en t+dt con un AlgebraicSolver (p.ej., NewtonKrylov).
-    - (Opcional) Estabilización de restricciones globales con Baumgarte.
+    Stepper implícito tipo Trapecio (global) con acoplo KKT por λ:
+    - Construye wiring en t y t+dt.
+    - Suma fuerzas de restricción Φ_q^T λ (via Model.compute_constraint_forces) en ambos tiempos.
+    - Integra continuos con predictor-corrector trapecial dependiente de z (λ).
+    - Resuelve el residual global en t+dt con un AlgebraicSolver (p.ej., NewtonKrylov).
+    - (Opcional) Estabilización de restricciones con Baumgarte.
     """
     name = "trapezoidal"
     is_global: bool = True
@@ -21,21 +24,41 @@ class TrapezoidalSolver(SolverBase):
         self,
         algebraic_solver: Optional[NewtonKrylov] = None,
         *,
-        tol: float = 1e-8,
-        max_iter: int = 20,
+        constraint_mode: Optional[str] = None,
+        # compatibilidad hacia atrás (si alguien sigue pasando baumgarte_enabled)
+        baumgarte_enabled: Optional[bool] = None,
         baumgarte_alpha: float = 0.0,
         baumgarte_beta: float = 0.0,
-        baumgarte_enabled: bool = False,
+        tol: float = 1e-8,
+        max_iter: int = 20,
     ):
+        """
+        constraint_mode:
+          - "kkt"            -> restricciones en t+dt vía KKT puro
+          - "kkt_baumgarte"  -> KKT con g* = g + α·dt·g_dot + β·dt²·g (Baumgarte)
+        Si 'constraint_mode' no se pasa pero se pasa 'baumgarte_enabled=True',
+        se asume "kkt_baumgarte" para compatibilidad.
+        """
         super().__init__()
         self.alg = algebraic_solver or NewtonKrylov()
         self.is_global = True
-        self.tol = float(tol)
-        self.max_iter = int(max_iter)
-        # Baumgarte
-        self.baumgarte_enabled = bool(baumgarte_enabled)
+
+        # Resolver modo con compatibilidad hacia atrás
+        if constraint_mode is None:
+            if baumgarte_enabled is True:
+                constraint_mode = "kkt_baumgarte"
+            else:
+                constraint_mode = "kkt"
+        if constraint_mode not in _ALLOWED_MODES:
+            raise ValueError(f"constraint_mode debe ser uno de {_ALLOWED_MODES}, got {constraint_mode!r}")
+        self.constraint_mode = constraint_mode
+
         self.baumgarte_alpha = float(baumgarte_alpha)
         self.baumgarte_beta  = float(baumgarte_beta)
+        # flag interno: si el modo es kkt_baumgarte, activamos Baumgarte
+        self._baumgarte_on = (self.constraint_mode == "kkt_baumgarte")
+        self.tol = float(tol)
+        self.max_iter = int(max_iter)
 
     def step_all(
         self,
@@ -48,14 +71,19 @@ class TrapezoidalSolver(SolverBase):
         from .block import ContinuousBlock, DiscreteBlock, Block
 
         B = next(iter(states.values())).shape[0] if states else 1
+        device = next(iter(states.values())).device if states else torch.device("cpu")
+        dtype  = next(iter(states.values())).dtype  if states else torch.float32
 
         downstream = model._downstream
         orderA = model._order_outputs
         ext_in = model._ext_in
 
-        # ----- helpers Fase A (wiring) -----
+        # -------- helpers: wiring (Fase A) --------
         def inject_externals(into_inbuf: Dict[str, Dict[str, torch.Tensor]], tnow: float):
             if externals_time_fn is None:
+                # limpiar igualmente
+                for d in into_inbuf.values():
+                    d.clear()
                 return
             ext_map = externals_time_fn(tnow) or {}
             for d in into_inbuf.values():
@@ -90,74 +118,109 @@ class TrapezoidalSolver(SolverBase):
                         inbuf[dst_blk][dst_port] = ten
             return inbuf, outs_cache
 
-        # ---------- 1) Residual en t (opcional/diagnóstico) ----------
-        inbuf_t, _ = phaseA_eval(states, t)
-        z0 = torch.zeros((B, 0), device=next(iter(states.values())).device, dtype=next(iter(states.values())).dtype)
+        # -------- tamaño de z (Rg) desde g(t,·) --------
+        inbuf_t0, _ = phaseA_eval(states, t)
+        g0 = _collect_global_constraints(model, t, states, inbuf_t0, z=None)  # (B,Rg)
+        Rg = int(g0.shape[1]) if g0.ndim == 2 else 0
+        z0 = torch.zeros((B, Rg), device=device, dtype=dtype)  # si Rg=0 => (B,0)
 
-        def F_now(z):
-            r = model.build_residual(t, states, {k: dict(v) for k, v in inbuf_t.items()}, z=z)
+        # -------- función de paso trapecial dependiente de z --------
+        def trap_step_with_z(zz: torch.Tensor):
+            """
+            Construye inbuf en t y t+dt, suma Φ_q^T λ, evalúa ODEs y devuelve:
+            (states_end_z, inbuf_end_z, outs_end_z).
+            """
+            # inbuf(t) + fuerzas de restricción(t)
+            inbuf_t, _ = phaseA_eval(states, t)
+            if zz is not None and zz.numel() > 0:
+                # Reparam: λ = (2/dt^2) * z  ⇒  x_{k+1} ≈ x_k + z   (mejor condicionamiento)
+                lam_eff = (2.0 / (dt * dt)) * zz
+                cons_t = model.compute_constraint_forces(t, states, inbuf_t, lam_eff) or {}
+                for bname, dports in cons_t.items():
+                    dst = inbuf_t.setdefault(bname, {})
+                    for pname, ten in dports.items():
+                        dst[pname] = dst.get(pname, 0) + ten
+
+            # predictor con dx0(z)
+            pred_states: Dict[str, torch.Tensor] = {}
+            for bname, blk in model.blocks.items():
+                st0 = states[bname]
+                if isinstance(blk, ContinuousBlock) and blk.state_size() > 0:
+                    ins_t = inbuf_t[bname]
+                    dx0, _ = blk.ode(st0, ins_t, t)
+                    pred_states[bname] = st0 + dt * dx0
+                elif isinstance(blk, DiscreteBlock) and blk.state_size() > 0:
+                    # predictor discreto: usar update hacia t+dt con inbuf(t) (aprox)
+                    st1p, _ = blk.update(st0, inbuf_t[bname], float(dt), float(t+dt))
+                    pred_states[bname] = st1p
+                else:
+                    pred_states[bname] = st0
+
+            # inbuf(t+dt) (con pred_states) + fuerzas de restricción(t+dt)
+            inbuf_t1, outs_t1 = phaseA_eval(pred_states, t + dt)
+            if zz is not None and zz.numel() > 0:
+                lam_eff1 = (2.0 / (dt * dt)) * zz
+                cons_t1 = model.compute_constraint_forces(t + dt, pred_states, inbuf_t1, lam_eff1) or {}
+                for bname, dports in cons_t1.items():
+                    dst = inbuf_t1.setdefault(bname, {})
+                    for pname, ten in dports.items():
+                        dst[pname] = dst.get(pname, 0) + ten
+
+            # corrector trapecial con inbuf(z)
+            new_states_z: Dict[str, torch.Tensor] = {k: v for k, v in states.items()}
+            for bname, blk in model.blocks.items():
+                st0 = states[bname]
+                if isinstance(blk, ContinuousBlock) and blk.state_size() > 0:
+                    ins_t  = inbuf_t[bname]
+                    ins_t1 = inbuf_t1[bname]
+                    dx0, _ = blk.ode(st0, ins_t, t)
+                    x_star = st0 + dt * dx0
+                    dx1, _ = blk.ode(x_star, ins_t1, t + dt)
+                    st1 = st0 + 0.5 * dt * (dx0 + dx1)
+                    new_states_z[bname] = st1
+                elif isinstance(blk, DiscreteBlock) and blk.state_size() > 0:
+                    st1, _ = blk.update(st0, inbuf_t1[bname], float(dt), float(t+dt))
+                    new_states_z[bname] = st1
+
+            inbuf_end_z, outs_end_z = phaseA_eval(new_states_z, t + dt)
+            return new_states_z, inbuf_end_z, outs_end_z
+
+        # -------- residual en t+dt dependiente de z (con Baumgarte opcional) --------
+        def F_end(zz: torch.Tensor):
+            st1, inbuf_end, _ = trap_step_with_z(zz)
+            r = model.build_residual(t + dt, states=st1, inbuf=inbuf_end, z=zz)
             return r[0] if isinstance(r, tuple) else r
 
-        # Resolver en t (útil si hay z(t) o diagnósticos; no forzamos uso posterior)
-        _ = self.alg.solve(F_now, z0)
-
-        # ---------- 2) Predictor para estimar inbuf en t+dt ----------
-        pred_states: Dict[str, torch.Tensor] = {}
-        for bname, blk in model.blocks.items():
-            st0 = states[bname]
-            if isinstance(blk, ContinuousBlock) and blk.state_size() > 0:
-                ins_t = inbuf_t[bname]
-                dx0, _ = blk.ode(st0, ins_t, t)
-                pred_states[bname] = st0 + dt * dx0
-            else:
-                pred_states[bname] = st0
-
-        inbuf_tp, _ = phaseA_eval(pred_states, t+dt)
-
-        # ---------- 3) Corrector trapecial ----------
-        new_states: Dict[str, torch.Tensor] = {k: v for k, v in states.items()}
-        for bname, blk in model.blocks.items():
-            st0 = states[bname]
-            if isinstance(blk, ContinuousBlock) and blk.state_size() > 0:
-                ins_t = inbuf_t[bname]
-                ins_tp = inbuf_tp[bname]
-                dx0, _ = blk.ode(st0, ins_t, t)
-                x_star = st0 + dt * dx0
-                dx1, _ = blk.ode(x_star, ins_tp, t+dt)
-                st1 = st0 + 0.5 * dt * (dx0 + dx1)
-                new_states[bname] = st1
-            elif isinstance(blk, DiscreteBlock) and blk.state_size() > 0:
-                st1, _ = blk.update(st0, inbuf_tp[bname], float(dt), float(t+dt))
-                new_states[bname] = st1
-
-        # ---------- 4) Residual en t+dt (con Baumgarte opcional) ----------
-        t_end = t + dt
-        inbuf_end, outs_end = phaseA_eval(new_states, t_end)
-
-        def F_end(zz):
-            r = model.build_residual(t_end, states=new_states, inbuf=inbuf_end, z=zz)
-            return r[0] if isinstance(r, tuple) else r
-
-        if self.baumgarte_enabled:
-            # Envolver F_end para sustituir las restricciones globales por g* (Baumgarte)
-            def F_end_baumgarte(zz):
+        # Elegir residual final según modo
+        if self.constraint_mode == "kkt":
+            F_to_solve = F_end
+        else:  # "kkt_baumgarte"
+            def F_end_baumgarte(z):
+                st1, inbuf_end, _ = trap_step_with_z(z)
+                # aplicar Baumgarte sobre el residual de restricciones globales
                 r_aug, _ = self._apply_baumgarte(
                     model,
-                    t_end=t_end,
+                    t_end=t + dt,
                     dt=dt,
-                    states_end=new_states,
+                    states_end=st1,
                     inbuf_end=inbuf_end,
-                    z_end=zz,
+                    z_end=z,
                 )
                 return r_aug
             F_to_solve = F_end_baumgarte
+
+        # Resolver z(t+dt) y USAR la solución devuelta por el solver
+        if Rg > 0:
+            z_star = self.alg.solve(F_to_solve, z0)
         else:
-            F_to_solve = F_end
+            z_star = z0
 
-        _ = self.alg.solve(F_to_solve, z0)  # resuelve z(t+dt); útil para DAE/LM
+        # (opcional) guarda por compatibilidad si tu NewtonKrylov no lo hace
+        setattr(self.alg, "last_solution", z_star)
 
-        # ---------- 5) Devolver estados y salidas a t+dt ----------
-        # (outs_end coherentes con new_states en t+dt)
+        # Reconstruir estado y salidas coherentes con z*
+        new_states, inbuf_end, outs_end = trap_step_with_z(z_star)
+
         return new_states, outs_end
 
     # ---------- Baumgarte ----------
@@ -184,7 +247,12 @@ class TrapezoidalSolver(SolverBase):
 
         # Extraer g(x)
         g = _collect_global_constraints(model, t_end, states_end, inbuf_end, z_end)
-        if g.shape[1] == 0 or not self.baumgarte_enabled or (self.baumgarte_alpha == 0.0 and self.baumgarte_beta == 0.0):
+        # si no hay restricciones globales, o el modo no es Baumgarte, o α/β = 0 → devolvemos residual original
+        if (
+            g.shape[1] == 0
+            or not self._baumgarte_on
+            or (self.baumgarte_alpha == 0.0 and self.baumgarte_beta == 0.0)
+        ):
             # reconstruye residual original (sin modificación)
             pieces: List[torch.Tensor] = []
             for bname in model.blocks.keys():
@@ -254,3 +322,31 @@ class TrapezoidalSolver(SolverBase):
             pieces.append(g_star)
         r_aug = torch.cat(pieces, dim=1) if len(pieces) > 0 else torch.zeros((B, 0), dtype=dtype, device=device)
         return r_aug, detail
+    
+    def _baumgarte_residual(self,
+                            model,
+                            *,
+                            t_begin: float,
+                            states_begin: dict,
+                            inbuf_begin: dict,
+                            t_end: float,
+                            states_end: dict,
+                            inbuf_end: dict,
+                            z_end: torch.Tensor,
+                            dt: float) -> torch.Tensor:
+        """
+        Residual de Baumgarte a tiempo n+1:
+            F_BG = gdot^{n+1} + alpha * g^{n+1}
+        con gdot^{n+1} ≈ (g^{n+1} - g^{n}) / dt
+
+        Devuelve un tensor (B, Rg).
+        """
+        # g^n (no depende de z_end)
+        g_begin, _ = model.build_residual(t_begin, states_begin, inbuf_begin, z=None)
+        # g^{n+1} (sí puede depender de z_end vía estados_end/inbuf_end)
+        g_end,   _ = model.build_residual(t_end,   states_end,   inbuf_end,   z=z_end)
+
+        gdot = (g_end - g_begin) / float(dt)
+        Fbg  = gdot + self.baumgarte_alpha * g_end
+        return Fbg
+

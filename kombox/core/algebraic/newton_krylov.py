@@ -112,15 +112,36 @@ class NewtonKrylov:
 
     # ---------------- Implementación JFNK (Jacobian-Free) ----------------
     @torch.enable_grad()
-    def _vjp(self, F: Callable[[Tensor], Tensor], z: Tensor, v: Tensor) -> Tensor:
-        """J^T v via autograd.grad."""
-        z = z.requires_grad_(True)
-        r = F(z)
-        assert r.shape[0] == v.shape[0], "batch mismatch en vjp"
-        JT_v = torch.autograd.grad(
-            outputs=r, inputs=z, grad_outputs=v, create_graph=True, retain_graph=True
-        )[0]
-        return JT_v
+    def _vjp(self, F, z: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        Vector–Jacobian product J(z)^T v computed with autograd.
+        - F(z): (B, R)
+        - z:    (B, Z)
+        - v:    (B, R)
+        Returns: (B, Z)
+
+        Robust to the case "F does not depend on z": in that situation ``y = F(z)``
+        will not require grad and ``autograd.grad`` would normally error. We detect
+        it and return zeros like ``z``. We also pass ``allow_unused=True`` and
+        sanitize possible ``None`` gradients.
+        """
+        with torch.enable_grad():
+            z = z.requires_grad_(True)
+            y = F(z)
+            # If F does not depend on z, y won't require grad → J = 0.
+            if not getattr(y, "requires_grad", False):
+                return torch.zeros_like(z)
+            grad = torch.autograd.grad(
+                y,
+                z,
+                grad_outputs=v,
+                retain_graph=True,
+                create_graph=True,
+                allow_unused=True,
+            )[0]
+            if grad is None:
+                return torch.zeros_like(z)
+            return grad
 
     @torch.enable_grad()
     def _jvp(self, F: Callable[[Tensor], Tensor], z: Tensor, v: Tensor) -> Tensor:
