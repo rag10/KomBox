@@ -1,6 +1,6 @@
 # kombox/core/model.py
 from __future__ import annotations
-from typing import Dict, Mapping, Tuple, Optional, List
+from typing import Dict, Mapping, Tuple, Optional, List, Callable
 from collections import deque
 import inspect
 import torch
@@ -47,7 +47,14 @@ class Model(Block):
         self._eq_constraints: Dict[str, callable] = {}
         self._compl_constraints: Dict[str, tuple] = {}  # name -> (c_fn, lambda_name)
         self._z_layout: Optional[Dict[str, object]] = None  # planificación de variables algebraicas
-        self._constraint_forces = {}  # name -> callable(t, states, inbuf, model, z, lam_i) -> nested dict
+
+        # NUEVO F3: sistema de hooks por restricción (múltiples hooks por nombre)
+        #   name -> List[Callable(t, states, inbuf, model, z, lam_i) -> {blk:{port:Tensor}}]
+        self._constraint_force_hooks: Dict[str, List[Callable]] = {}
+
+        # Back-compat (pre-F3): había un único hook por nombre; seguimos aceptándolo
+        # si algún código antiguo usa add_constraint_force sin lista.
+        self._constraint_forces: Dict[str, Callable] = {}
 
         self._edges = []                 # lista de (src_blk, src_port, dst_blk, dst_port)
         self._constraints = []           # lista de (name, fn)
@@ -424,9 +431,9 @@ class Model(Block):
                     g = fn(t, states_in, inbuf, self)
             except TypeError:
                 try:
+                    g = fn(t, states_in, inbuf, self)
+                except TypeError:
                     g = fn(t, states_in, inbuf)
-                except TypeError as e:
-                    raise TypeError(f"Constraint '{name}' no acepta firma compatible") from e
 
             if g is None:
                 continue
@@ -460,15 +467,28 @@ class Model(Block):
         self.topology.sccs = g.sccs()
         return self.topology.sccs
         
-    def add_constraint_force(self, name: str, fn):
+    # ==================== NUEVO F3: registro de hooks ====================
+    def add_constraint_force(self, name: str, hook: Callable):
         """
         Registra un 'force hook' para la restricción global `name`.
-        Firma: fn(t, states, inbuf, model, z, lam_i) -> {blk: {port: Tensor(B, width)}}
-        donde lam_i es (B, r_i) para esta restricción.
+        Firma del hook:
+            hook(t, states, inbuf, model, z, lam_i) -> {blk: {port: Tensor(B,width)}}
+        - Permite registrar VARIOS hooks por la misma restricción; las contribuciones se suman.
+        - Valida que `name` exista en las restricciones globales registradas.
         """
-        self._constraint_forces[name] = fn
+        if not any(n == name for (n, _) in self._constraints):
+            known = [n for (n, _) in self._constraints]
+            raise KeyError(
+                f"add_constraint_force: restricción '{name}' no existe. "
+                f"Defínela antes con add_constraint_eq(). Disponibles: {known}"
+            )
+        self._constraint_force_hooks.setdefault(name, []).append(hook)
+        # compat: también mantén el "único hook" si no estaba definido
+        if name not in self._constraint_forces:
+            self._constraint_forces[name] = hook
         return self
 
+    # === helpers internos usados por el solver ===
     def _iter_constraints_with_sizes(self, t, states, inbuf, z):
         """
         Itera (name, fn, r_i, g_i) en el orden de registro, calculando r_i (= cols de g_i).
@@ -483,9 +503,10 @@ class Model(Block):
                 else:
                     g_i = fn(t, states, inbuf, self)
             except TypeError:
-                g_i = fn(t, states, inbuf)
+                g_i = fn(t, states, inbuf, self)
             if g_i is None:
                 r_i = 0
+                g_i = torch.zeros((next(iter(states.values())).shape[0], 0), device=next(iter(states.values())).device) if states else torch.zeros((1,0))
             else:
                 g_i = g_i if g_i.ndim == 2 else g_i.view(g_i.shape[0], -1)
                 r_i = g_i.shape[1]
@@ -494,31 +515,38 @@ class Model(Block):
     def compute_constraint_forces(self, t, states, inbuf, z):
         """
         Devuelve un nested dict {blk: {port: Tensor}} con la suma de fuerzas de restricción
-        sobre todos los 'force hooks' registrados. z tiene forma (B, Rg) y se trocea por restricción.
+        sobre todos los 'force hooks' registrados. `z` tiene forma (B, Rg) y se trocea por restricción.
+        - Suma todas las contribuciones de la LISTA de hooks por nombre (F3).
+        - Back-compat: si solo se registró un hook con la API antigua, también se aplica.
         """
         import torch
-        if z is None or z.numel() == 0 or len(self._constraint_forces) == 0:
+        if z is None or z.numel() == 0:
             return {}
         B = z.shape[0]
         ofs = 0
         acc = {}  # blk -> port -> tensor
         for name, fn, r_i, _ in self._iter_constraints_with_sizes(t, states, inbuf, z):
-            if r_i == 0: 
+            if r_i == 0:
                 continue
             lam_i = z[:, ofs:ofs+r_i]  # (B, r_i)
             ofs += r_i
-            hook = self._constraint_forces.get(name, None)
-            if hook is None:
-                continue  # sin hook, no hay fuerzas para esta restricción
-            contrib = hook(t, states, inbuf, self, z, lam_i) or {}
-            # acumular sumando
-            for bname, dports in contrib.items():
-                bd = acc.setdefault(bname, {})
-                for pname, ten in dports.items():
-                    if pname in bd:
-                        bd[pname] = bd[pname] + ten
-                    else:
-                        bd[pname] = ten
+
+            hooks = self._constraint_force_hooks.get(name, [])
+            # compat: añade el único hook antiguo si no estaba incluido aún
+            old_single = self._constraint_forces.get(name, None)
+            if old_single and old_single not in hooks:
+                hooks = hooks + [old_single]
+
+            for hook in hooks:
+                contrib = hook(t, states, inbuf, self, z, lam_i) or {}
+                # acumular sumando
+                for bname, dports in contrib.items():
+                    bd = acc.setdefault(bname, {})
+                    for pname, ten in dports.items():
+                        if pname in bd:
+                            bd[pname] = bd[pname] + ten
+                        else:
+                            bd[pname] = ten
         return acc
 
     # ---------------- utilidades ----------------

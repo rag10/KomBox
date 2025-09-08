@@ -1,21 +1,24 @@
 # kombox/core/solvers_trapezoidal.py
 from __future__ import annotations
-from typing import Dict, Callable, Optional, Tuple, List
+from typing import Dict, Callable, Optional, Tuple, List, Sequence, Literal
+import inspect
 import torch
 from .solvers import SolverBase
-from .simulator import _flatten_states, _unflatten_states, _collect_global_constraints
 from .algebraic.newton_krylov import NewtonKrylov  # import correcto
 
-_ALLOWED_MODES = {"kkt", "kkt_baumgarte"}
+_ALLOWED_MODES = {"kkt", "kkt_baumgarte", "kkt_mixed"}
 
 class TrapezoidalSolver(SolverBase):
     """
-    Stepper implícito tipo Trapecio (global) con acoplo KKT por λ:
-    - Construye wiring en t y t+dt.
-    - Suma fuerzas de restricción Φ_q^T λ (via Model.compute_constraint_forces) en ambos tiempos.
-    - Integra continuos con predictor-corrector trapecial dependiente de z (λ).
-    - Resuelve el residual global en t+dt con un AlgebraicSolver (p.ej., NewtonKrylov).
-    - (Opcional) Estabilización de restricciones con Baumgarte.
+    Stepper implícito tipo Trapecio (global) con manejo de restricciones:
+      - 'kkt':           todas con λ (KKT puro).
+      - 'kkt_baumgarte': todas con estabilización de Baumgarte (sin λ).
+      - 'kkt_mixed':     subconjunto con λ (lam_mask=True) y resto con Baumgarte (lam_mask=False).
+
+    Además:
+      - Re-eval de externals a t y t+dt.
+      - Inyección de fuerzas por hooks tanto de KKT (λ) como de Baumgarte (λ_bg).
+      - Validaciones claras de mask, hooks y shapes.
     """
     name = "trapezoidal"
     is_global: bool = True
@@ -24,42 +27,97 @@ class TrapezoidalSolver(SolverBase):
         self,
         algebraic_solver: Optional[NewtonKrylov] = None,
         *,
-        constraint_mode: Optional[str] = None,
-        # compatibilidad hacia atrás (si alguien sigue pasando baumgarte_enabled)
-        baumgarte_enabled: Optional[bool] = None,
-        baumgarte_alpha: float = 0.0,
-        baumgarte_beta: float = 0.0,
+        constraint_mode: Literal["kkt","kkt_baumgarte","kkt_mixed"] = "kkt",
+        lam_mask: Optional[Sequence[bool]] = None,
+        baumgarte_alpha: float = 1.0,
+        baumgarte_beta: float = 10.0,
         tol: float = 1e-8,
         max_iter: int = 20,
+        debug: bool = False,
+        # ---- compatibilidad hacia atrás ----
+        baumgarte_enabled: Optional[bool] = None,
     ):
-        """
-        constraint_mode:
-          - "kkt"            -> restricciones en t+dt vía KKT puro
-          - "kkt_baumgarte"  -> KKT con g* = g + α·dt·g_dot + β·dt²·g (Baumgarte)
-        Si 'constraint_mode' no se pasa pero se pasa 'baumgarte_enabled=True',
-        se asume "kkt_baumgarte" para compatibilidad.
-        """
         super().__init__()
         self.alg = algebraic_solver or NewtonKrylov()
         self.is_global = True
 
-        # Resolver modo con compatibilidad hacia atrás
-        if constraint_mode is None:
-            if baumgarte_enabled is True:
-                constraint_mode = "kkt_baumgarte"
-            else:
-                constraint_mode = "kkt"
-        if constraint_mode not in _ALLOWED_MODES:
-            raise ValueError(f"constraint_mode debe ser uno de {_ALLOWED_MODES}, got {constraint_mode!r}")
-        self.constraint_mode = constraint_mode
+        # Compat: mapear baumgarte_enabled -> constraint_mode si aplica
+        cm = str(constraint_mode)
+        if baumgarte_enabled is not None:
+            if baumgarte_enabled and cm == "kkt":
+                cm = "kkt_baumgarte"
+            if baumgarte_enabled is False and constraint_mode == "kkt_baumgarte":
+                raise ValueError("Inconsistencia: baumgarte_enabled=False pero constraint_mode='kkt_baumgarte'.")
 
+        if cm not in _ALLOWED_MODES:
+            raise ValueError(f"constraint_mode inválido: {cm!r}. Debe ser uno de {_ALLOWED_MODES}.")
+        self.constraint_mode = cm
+
+        self._lam_mask_in = list(lam_mask) if lam_mask is not None else None
         self.baumgarte_alpha = float(baumgarte_alpha)
         self.baumgarte_beta  = float(baumgarte_beta)
-        # flag interno: si el modo es kkt_baumgarte, activamos Baumgarte
-        self._baumgarte_on = (self.constraint_mode == "kkt_baumgarte")
         self.tol = float(tol)
         self.max_iter = int(max_iter)
+        self.debug = bool(debug)
 
+    # ----------------- helpers privados -----------------
+    def _phaseA_eval(
+        self, model, states, tnow: float,
+        externals_time_fn: Optional[Callable[[float], Dict[str, Dict[str, torch.Tensor]]]]
+    ) -> Tuple[Dict[str,Dict[str,torch.Tensor]], Dict[str,Dict[str,torch.Tensor]]]:
+        """Evalúa fase A: outs y wiring → inbuf. Requiere externals_time_fn(t) si hay externals."""
+        inbuf: Dict[str, Dict[str, torch.Tensor]] = {n: {} for n in model.blocks.keys()}
+        ext_map = externals_time_fn(tnow) or {} if externals_time_fn is not None else {}
+        # inyección estricta de externals solo si existen
+        for ext_name, targets in model._ext_in.items():
+            if ext_name not in ext_map:
+                raise KeyError(f"Falta entrada externa '{ext_name}' en externals_fn(t={tnow:.6f}).")
+            src_dict = ext_map[ext_name]
+            for (blk, port) in targets:
+                if port in src_dict:
+                    inbuf[blk][port] = src_dict[port]
+                elif len(src_dict) == 1:
+                    inbuf[blk][port] = next(iter(src_dict.values()))
+                else:
+                    raise KeyError(f"External '{ext_name}' no provee puerto '{port}'.")
+        outs: Dict[str, Dict[str, torch.Tensor]] = {n: {} for n in model.blocks.keys()}
+        for bname in model._order_outputs:
+            blk = model.blocks[bname]; st = states[bname]; ins = inbuf[bname]
+            o = blk._expose_outputs(st, ins, tnow)
+            outs[bname] = o
+            for (pname, ten) in o.items():
+                for (dst_blk, dst_port) in model._downstream.get((bname, pname), []):
+                    inbuf[dst_blk][dst_port] = ten
+        return inbuf, outs
+
+    def _split_constraints_by_mask(self, model, lam_mask: Sequence[bool]) -> Tuple[List[int], List[int], List[str], List[str]]:
+        """Devuelve (idx_lam, idx_bg, names_lam, names_bg) respetando el orden de registro."""
+        names = [n for (n, _) in model._constraints]
+        if len(lam_mask) != len(names):
+            raise ValueError(
+                f"lam_mask longitud={len(lam_mask)} != nº restricciones={len(names)}. "
+                f"Restricciones: {names}"
+            )
+        idx_lam = [i for i, m in enumerate(lam_mask) if bool(m)]
+        idx_bg  = [i for i, m in enumerate(lam_mask) if not bool(m)]
+        names_lam = [names[i] for i in idx_lam]
+        names_bg  = [names[i] for i in idx_bg]
+        return idx_lam, idx_bg, names_lam, names_bg
+
+    def _eval_constraints_list(self, model, t, states, inbuf) -> List[torch.Tensor]:
+        """Evalúa g_i por restricción (lista) en orden de registro."""
+        vals: List[torch.Tensor] = []
+        for (name, fn) in model._constraints:
+            try:
+                sig = inspect.signature(fn); use_z = (len(sig.parameters) >= 5)
+            except Exception:
+                use_z = False
+            g = fn(t, states, inbuf, model, None) if use_z else fn(t, states, inbuf, model)
+            g = g if g.ndim == 2 else g.view(g.shape[0], -1)
+            vals.append(g)
+        return vals
+
+    # ----------------- paso global -----------------
     def step_all(
         self,
         model,
@@ -68,285 +126,233 @@ class TrapezoidalSolver(SolverBase):
         t: float,
         externals_time_fn: Optional[Callable[[float], Dict[str, Dict[str, torch.Tensor]]]] = None
     ):
-        from .block import ContinuousBlock, DiscreteBlock, Block
+        from .block import ContinuousBlock, DiscreteBlock
+
+        # --- Fase A en t ---
+        inbuf_t0, _ = self._phaseA_eval(model, states, t, externals_time_fn)
+
+        # --------- CASO SIN RESTRICCIONES: Trapecio puro y retorno seguro ---------
+        if len(getattr(model, "_constraints", [])) == 0:
+            # predictor con inbuf(t)
+            pred_states: Dict[str, torch.Tensor] = {}
+            for bname, blk in model.blocks.items():
+                st0 = states[bname]
+                if isinstance(blk, ContinuousBlock) and blk.state_size() > 0:
+                    dx0, _ = blk.ode(st0, inbuf_t0[bname], t)
+                    pred_states[bname] = st0 + dt * dx0
+                elif isinstance(blk, DiscreteBlock) and blk.state_size() > 0:
+                    st1p, _ = blk.update(st0, inbuf_t0[bname], float(dt), float(t+dt))
+                    pred_states[bname] = st1p
+                else:
+                    pred_states[bname] = st0
+            # fase A en t+dt con predictor
+            inbuf_t1, _ = self._phaseA_eval(model, pred_states, t + dt, externals_time_fn)
+            # corrector trapecial (continuos) + actualización discretos
+            new_states: Dict[str, torch.Tensor] = {k: v for k, v in states.items()}
+            for bname, blk in model.blocks.items():
+                st0 = states[bname]
+                if isinstance(blk, ContinuousBlock) and blk.state_size() > 0:
+                    dx0, _ = blk.ode(st0, inbuf_t0[bname], t)
+                    x_star = st0 + dt * dx0
+                    dx1, _ = blk.ode(x_star, inbuf_t1[bname], t + dt)
+                    st1 = st0 + 0.5 * dt * (dx0 + dx1)
+                    new_states[bname] = st1
+                elif isinstance(blk, DiscreteBlock) and blk.state_size() > 0:
+                    st1, _ = blk.update(st0, inbuf_t1[bname], float(dt), float(t+dt))
+                    new_states[bname] = st1
+            _, outs_end = self._phaseA_eval(model, new_states, t + dt, externals_time_fn)
+            return new_states, outs_end
+
+        # --------- A partir de aquí: hay restricciones globales ---------
+        if self.constraint_mode == "kkt_baumgarte" and self._lam_mask_in is not None:
+            if any(self._lam_mask_in):
+                raise ValueError("lam_mask no aplica en 'kkt_baumgarte'. Elimina o pasa todo False.")
 
         B = next(iter(states.values())).shape[0] if states else 1
         device = next(iter(states.values())).device if states else torch.device("cpu")
         dtype  = next(iter(states.values())).dtype  if states else torch.float32
 
-        downstream = model._downstream
-        orderA = model._order_outputs
-        ext_in = model._ext_in
+        # tamaños por restricción y offsets
+        sizes: List[int] = []
+        for name, fn in model._constraints:
+            try:
+                sig = inspect.signature(fn); use_z = (len(sig.parameters) >= 5)
+            except Exception:
+                use_z = False
+            g0_i = fn(t, states, inbuf_t0, model, None) if use_z else fn(t, states, inbuf_t0, model)
+            g0_i = g0_i if g0_i.ndim == 2 else g0_i.view(g0_i.shape[0], -1)
+            sizes.append(int(g0_i.shape[1]))
+        ofs = [0]; [ofs.append(ofs[-1] + s) for s in sizes]
+        Rg_total = int(ofs[-1])
 
-        # -------- helpers: wiring (Fase A) --------
-        def inject_externals(into_inbuf: Dict[str, Dict[str, torch.Tensor]], tnow: float):
-            if externals_time_fn is None:
-                # limpiar igualmente
-                for d in into_inbuf.values():
-                    d.clear()
-                return
-            ext_map = externals_time_fn(tnow) or {}
-            for d in into_inbuf.values():
-                d.clear()
-            for ext_name, targets in ext_in.items():
-                if ext_name not in ext_map:
-                    raise KeyError(f"Falta entrada externa '{ext_name}' en externals_fn(t={tnow:.6f}).")
-                src_dict = ext_map[ext_name]
-                for (blk, port) in targets:
-                    if port in src_dict:
-                        ten = src_dict[port]
-                    elif len(src_dict) == 1:
-                        ten = next(iter(src_dict.values()))
-                    elif ext_name in src_dict and isinstance(src_dict[ext_name], torch.Tensor):
-                        ten = src_dict[ext_name]
-                    else:
-                        raise KeyError(f"External '{ext_name}' no provee puerto '{port}'.")
-                    into_inbuf[blk][port] = ten
+        # máscara por modo
+        if self.constraint_mode == "kkt_mixed":
+            if self._lam_mask_in is None:
+                raise ValueError("kkt_mixed requiere lam_mask (lista/tupla de bool).")
+            if not isinstance(self._lam_mask_in, (list, tuple)) or not all(isinstance(b, (bool,)) for b in self._lam_mask_in):
+                raise TypeError("lam_mask debe ser lista/tupla de bool.")
+            idx_lam = [i for i, m in enumerate(self._lam_mask_in) if m]
+            idx_bg  = [i for i, m in enumerate(self._lam_mask_in) if not m]
+        elif self.constraint_mode == "kkt":
+            idx_lam = list(range(len(sizes))); idx_bg = []
+        else:  # kkt_baumgarte
+            idx_lam = []; idx_bg = list(range(len(sizes)))
 
-        def phaseA_eval(states_dict: Dict[str, torch.Tensor], tnow: float):
-            inbuf: Dict[str, Dict[str, torch.Tensor]] = {n: {} for n in model.blocks.keys()}
-            inject_externals(inbuf, tnow)
-            outs_cache: Dict[str, Dict[str, torch.Tensor]] = {n: {} for n in model.blocks.keys()}
-            for bname in orderA:
-                blk: Block = model.blocks[bname]
-                st = states_dict[bname]
-                ins = inbuf[bname]
-                outs = blk._expose_outputs(st, ins, tnow)
-                outs_cache[bname] = outs
-                for (port_name, ten) in outs.items():
-                    for (dst_blk, dst_port) in downstream.get((bname, port_name), []):
-                        inbuf[dst_blk][dst_port] = ten
-            return inbuf, outs_cache
+        # validación hooks en KKT
+        for i in idx_lam:
+            name_i = model._constraints[i][0]
+            hooks = model._constraint_force_hooks.get(name_i, [])
+            if len(hooks) == 0 and name_i not in model._constraint_forces:
+                raise RuntimeError(
+                    f"Restricción '{name_i}' marcada para λ no tiene force hooks. "
+                    f"Registre con model.add_constraint_force('{name_i}', hook)."
+                )
 
-        # -------- tamaño de z (Rg) desde g(t,·) --------
-        inbuf_t0, _ = phaseA_eval(states, t)
-        g0 = _collect_global_constraints(model, t, states, inbuf_t0, z=None)  # (B,Rg)
-        Rg = int(g0.shape[1]) if g0.ndim == 2 else 0
-        z0 = torch.zeros((B, Rg), device=device, dtype=dtype)  # si Rg=0 => (B,0)
+        # empaquetado λ por restricción a vector full
+        def pack_full(lam_list: List[Optional[torch.Tensor]]) -> torch.Tensor:
+            zfull = torch.zeros((B, Rg_total), device=device, dtype=dtype)
+            for k, lam_k in enumerate(lam_list):
+                if lam_k is None: 
+                    continue
+                s = sizes[k]
+                if lam_k.shape != (B, s):
+                    raise ValueError(f"λ para restricción {k} con shape {tuple(lam_k.shape)}; se esperaba {(B,s)}.")
+                zfull[:, ofs[k]:ofs[k]+s] = lam_k
+            return zfull
 
-        # -------- función de paso trapecial dependiente de z --------
-        def trap_step_with_z(zz: torch.Tensor):
-            """
-            Construye inbuf en t y t+dt, suma Φ_q^T λ, evalúa ODEs y devuelve:
-            (states_end_z, inbuf_end_z, outs_end_z).
-            """
-            # inbuf(t) + fuerzas de restricción(t)
-            inbuf_t, _ = phaseA_eval(states, t)
-            if zz is not None and zz.numel() > 0:
-                # Reparam: λ = (2/dt^2) * z  ⇒  x_{k+1} ≈ x_k + z   (mejor condicionamiento)
-                lam_eff = (2.0 / (dt * dt)) * zz
-                cons_t = model.compute_constraint_forces(t, states, inbuf_t, lam_eff) or {}
+        # z compacto (solo λ-KKT)
+        R_lam = sum(sizes[i] for i in idx_lam)
+        z0_compact = torch.zeros((B, R_lam), device=device, dtype=dtype)
+
+        def expand_to_full(zz_compact: torch.Tensor) -> torch.Tensor:
+            if zz_compact is None or zz_compact.numel() == 0:
+                return torch.zeros((B, Rg_total), device=device, dtype=dtype)
+            zfull = torch.zeros((B, Rg_total), device=device, dtype=dtype)
+            off_c = 0
+            for i in idx_lam:
+                s = sizes[i]
+                zfull[:, ofs[i]:ofs[i]+s] = zz_compact[:, off_c:off_c+s]
+                off_c += s
+            return zfull
+
+        # -------- paso trapecial dependiente de z, inyectando KKT + Baumgarte --------
+        def trap_step_with_z(zc: torch.Tensor):
+            from .block import ContinuousBlock, DiscreteBlock
+            # (1) inbuf(t) + λ_KKT(t)
+            inbuf_t, _ = self._phaseA_eval(model, states, t, externals_time_fn)
+            if R_lam > 0:
+                lam_kkt_t = (2.0 / (dt * dt)) * expand_to_full(zc)
+                cons_t = model.compute_constraint_forces(t, states, inbuf_t, lam_kkt_t) or {}
                 for bname, dports in cons_t.items():
                     dst = inbuf_t.setdefault(bname, {})
                     for pname, ten in dports.items():
                         dst[pname] = dst.get(pname, 0) + ten
 
-            # predictor con dx0(z)
+            # (2) Baumgarte en t: λ_bg^t = - α·g0   (solo idx_bg)
+            if len(idx_bg) > 0:
+                g0_list = self._eval_constraints_list(model, t, states, inbuf_t)
+                lam_list_t: List[Optional[torch.Tensor]] = [None]*len(sizes)
+                for k in idx_bg:
+                    g0 = g0_list[k]
+                    lam_list_t[k] = - self.baumgarte_alpha * g0
+                lam_bg_t_full = pack_full(lam_list_t)
+                if lam_bg_t_full.numel() > 0:
+                    cons_bg_t = model.compute_constraint_forces(t, states, inbuf_t, lam_bg_t_full) or {}
+                    for bname, dports in cons_bg_t.items():
+                        dst = inbuf_t.setdefault(bname, {})
+                        for pname, ten in dports.items():
+                            dst[pname] = dst.get(pname, 0) + ten
+
+            # (3) predictor con inbuf(t) ya modificado
             pred_states: Dict[str, torch.Tensor] = {}
             for bname, blk in model.blocks.items():
                 st0 = states[bname]
                 if isinstance(blk, ContinuousBlock) and blk.state_size() > 0:
-                    ins_t = inbuf_t[bname]
-                    dx0, _ = blk.ode(st0, ins_t, t)
+                    dx0, _ = blk.ode(st0, inbuf_t[bname], t)
                     pred_states[bname] = st0 + dt * dx0
                 elif isinstance(blk, DiscreteBlock) and blk.state_size() > 0:
-                    # predictor discreto: usar update hacia t+dt con inbuf(t) (aprox)
                     st1p, _ = blk.update(st0, inbuf_t[bname], float(dt), float(t+dt))
                     pred_states[bname] = st1p
                 else:
                     pred_states[bname] = st0
 
-            # inbuf(t+dt) (con pred_states) + fuerzas de restricción(t+dt)
-            inbuf_t1, outs_t1 = phaseA_eval(pred_states, t + dt)
-            if zz is not None and zz.numel() > 0:
-                lam_eff1 = (2.0 / (dt * dt)) * zz
-                cons_t1 = model.compute_constraint_forces(t + dt, pred_states, inbuf_t1, lam_eff1) or {}
+            # (4) inbuf(t+dt) + λ_KKT(t+dt)
+            inbuf_t1, outs_t1 = self._phaseA_eval(model, pred_states, t + dt, externals_time_fn)
+            if R_lam > 0:
+                lam_kkt_t1 = (2.0 / (dt * dt)) * expand_to_full(zc)
+                cons_t1 = model.compute_constraint_forces(t + dt, pred_states, inbuf_t1, lam_kkt_t1) or {}
                 for bname, dports in cons_t1.items():
                     dst = inbuf_t1.setdefault(bname, {})
                     for pname, ten in dports.items():
                         dst[pname] = dst.get(pname, 0) + ten
 
-            # corrector trapecial con inbuf(z)
+            # (5) Baumgarte en t+dt: λ_bg^{t+dt} = - α·g1_pred - β·(g1_pred - g0)/dt  (solo idx_bg)
+            if len(idx_bg) > 0:
+                g0_list = self._eval_constraints_list(model, t, states, inbuf_t)             # g0 con inbuf(t)
+                g1_list = self._eval_constraints_list(model, t + dt, pred_states, inbuf_t1)   # g1_pred con predictor
+                lam_list_t1: List[Optional[torch.Tensor]] = [None]*len(sizes)
+                for k in idx_bg:
+                    g0 = g0_list[k]; g1 = g1_list[k]
+                    gdot = (g1 - g0) / float(dt)
+                    lam_list_t1[k] = - (self.baumgarte_alpha * g1 + self.baumgarte_beta * gdot)
+                lam_bg_t1_full = pack_full(lam_list_t1)
+                if lam_bg_t1_full.numel() > 0:
+                    cons_bg_t1 = model.compute_constraint_forces(t + dt, pred_states, inbuf_t1, lam_bg_t1_full) or {}
+                    for bname, dports in cons_bg_t1.items():
+                        dst = inbuf_t1.setdefault(bname, {})
+                        for pname, ten in dports.items():
+                            dst[pname] = dst.get(pname, 0) + ten
+
+            # (6) corrector trapecial con inbuf(t) y inbuf(t+dt) ya modificados
             new_states_z: Dict[str, torch.Tensor] = {k: v for k, v in states.items()}
             for bname, blk in model.blocks.items():
                 st0 = states[bname]
                 if isinstance(blk, ContinuousBlock) and blk.state_size() > 0:
-                    ins_t  = inbuf_t[bname]
-                    ins_t1 = inbuf_t1[bname]
-                    dx0, _ = blk.ode(st0, ins_t, t)
+                    dx0, _ = blk.ode(st0, inbuf_t[bname], t)
                     x_star = st0 + dt * dx0
-                    dx1, _ = blk.ode(x_star, ins_t1, t + dt)
+                    dx1, _ = blk.ode(x_star, inbuf_t1[bname], t + dt)
                     st1 = st0 + 0.5 * dt * (dx0 + dx1)
                     new_states_z[bname] = st1
                 elif isinstance(blk, DiscreteBlock) and blk.state_size() > 0:
                     st1, _ = blk.update(st0, inbuf_t1[bname], float(dt), float(t+dt))
                     new_states_z[bname] = st1
 
-            inbuf_end_z, outs_end_z = phaseA_eval(new_states_z, t + dt)
-            return new_states_z, inbuf_end_z, outs_end_z
+            inbuf_end_z, outs_end_z = self._phaseA_eval(model, new_states_z, t + dt, externals_time_fn)
+            return new_states_z, inbuf_t, inbuf_end_z, outs_end_z
 
-        # -------- residual en t+dt dependiente de z (con Baumgarte opcional) --------
-        def F_end(zz: torch.Tensor):
-            st1, inbuf_end, _ = trap_step_with_z(zz)
-            r = model.build_residual(t + dt, states=st1, inbuf=inbuf_end, z=zz)
-            return r[0] if isinstance(r, tuple) else r
+        # -------- residuales (usados para resolver λ en KKT/KKT_mixed) --------
+        def F_kkt(zc: torch.Tensor):
+            st1, _, inbuf_end, _ = trap_step_with_z(zc)
+            r, _ = model.build_residual(t + dt, states=st1, inbuf=inbuf_end, z=expand_to_full(zc))
+            return r
 
-        # Elegir residual final según modo
+        def F_baumgarte(_zc: torch.Tensor):
+            # En Baumgarte puro no hay λ que resolver; residual vacío.
+            return torch.zeros((B, 0), device=device, dtype=dtype)
+
+        def F_mixed(zc: torch.Tensor):
+            st1, _, inbuf_end, _ = trap_step_with_z(zc)
+            # Evalúa g en t+dt y selecciona idx_lam (lo único que se resuelve con z):
+            g_all = self._eval_constraints_list(model, t + dt, st1, inbuf_end)
+            if len(idx_lam) == 0:
+                return torch.zeros((B, 0), device=device, dtype=dtype)
+            return torch.cat([g_all[i] for i in idx_lam], dim=1)
+
+        # Elegir F a resolver
         if self.constraint_mode == "kkt":
-            F_to_solve = F_end
-        else:  # "kkt_baumgarte"
-            def F_end_baumgarte(z):
-                st1, inbuf_end, _ = trap_step_with_z(z)
-                # aplicar Baumgarte sobre el residual de restricciones globales
-                r_aug, _ = self._apply_baumgarte(
-                    model,
-                    t_end=t + dt,
-                    dt=dt,
-                    states_end=st1,
-                    inbuf_end=inbuf_end,
-                    z_end=z,
-                )
-                return r_aug
-            F_to_solve = F_end_baumgarte
-
-        # Resolver z(t+dt) y USAR la solución devuelta por el solver
-        if Rg > 0:
-            z_star = self.alg.solve(F_to_solve, z0)
+            F_to_solve = F_kkt
+        elif self.constraint_mode == "kkt_baumgarte":
+            F_to_solve = F_baumgarte
         else:
-            z_star = z0
+            F_to_solve = F_mixed
 
-        # (opcional) guarda por compatibilidad si tu NewtonKrylov no lo hace
+        # Resolver z* (compacto si corresponde) y construir estado final
+        if (self.constraint_mode == "kkt" and Rg_total > 0) or (self.constraint_mode == "kkt_mixed" and R_lam > 0):
+            z_star = self.alg.solve(F_to_solve, z0_compact)
+        else:
+            z_star = z0_compact  # (B,0)
         setattr(self.alg, "last_solution", z_star)
 
-        # Reconstruir estado y salidas coherentes con z*
-        new_states, inbuf_end, outs_end = trap_step_with_z(z_star)
-
+        # Reconstruir estado/outs coherentes con z*
+        new_states, _, inbuf_end, outs_end = trap_step_with_z(z_star)
         return new_states, outs_end
-
-    # ---------- Baumgarte ----------
-    def _apply_baumgarte(
-        self,
-        model,
-        *,
-        t_end: float,
-        dt: float,
-        states_end: Dict[str, torch.Tensor],
-        inbuf_end: Dict[str, Dict[str, torch.Tensor]],
-        z_end: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Crea un residual 'reconstruido' donde las restricciones globales han sido
-        estabilizadas con Baumgarte:
-            g* = g + α dt g_dot + β dt^2 g
-        con  g_dot ≈ J_g(x) · f(x)  (vía autograd).
-        """
-        r_raw, detail = model.build_residual(t_end, states=states_end, inbuf=inbuf_end, z=z_end)
-        B = r_raw.shape[0] if r_raw.ndim == 2 else 1
-        dtype = r_raw.dtype
-        device = r_raw.device
-
-        # Extraer g(x)
-        g = _collect_global_constraints(model, t_end, states_end, inbuf_end, z_end)
-        # si no hay restricciones globales, o el modo no es Baumgarte, o α/β = 0 → devolvemos residual original
-        if (
-            g.shape[1] == 0
-            or not self._baumgarte_on
-            or (self.baumgarte_alpha == 0.0 and self.baumgarte_beta == 0.0)
-        ):
-            # reconstruye residual original (sin modificación)
-            pieces: List[torch.Tensor] = []
-            for bname in model.blocks.keys():
-                if bname in detail:
-                    vv = detail[bname]; vv = vv if vv.ndim == 2 else vv.view(B, -1)
-                    pieces.append(vv)
-            for (cname, _) in model._constraints:
-                key = f"__global__::{cname}"
-                if key in detail:
-                    vv = detail[key]; vv = vv if vv.ndim == 2 else vv.view(B, -1)
-                    pieces.append(vv)
-            return (torch.cat(pieces, dim=1) if len(pieces) > 0 else torch.zeros((B, 0), dtype=dtype, device=device)), detail
-
-        # Aplanar estados y construir f(x) en t_end
-        Xall, metas = _flatten_states(states_end)
-        if Xall.shape[1] == 0:
-            pieces = []
-            for bname in model.blocks.keys():
-                if bname in detail: pieces.append(detail[bname])
-            for (cname, _) in model._constraints:
-                key = f"__global__::{cname}"
-                if key in detail: pieces.append(detail[key])
-            return (torch.cat(pieces, dim=1) if len(pieces) > 0 else torch.zeros((B, 0), dtype=dtype, device=device)), detail
-
-        # f_end por concatenación de dx/dt
-        f_cols = []
-        for bname, blk in model.blocks.items():
-            st = states_end[bname]
-            ins = inbuf_end.get(bname, {})
-            dx, _ = blk.ode(st, ins, t_end)
-            f_cols.append(dx if dx.ndim == 2 else dx.view(B, -1))
-        f_end = torch.cat([c for c in f_cols if c.numel() > 0], dim=1) if len(f_cols) > 0 else torch.zeros_like(Xall)
-
-        # g(x) y J_g(x) batched (sin in-place)
-        def g_only(Xflat: torch.Tensor) -> torch.Tensor:
-            st = _unflatten_states(Xflat, metas, states_end)
-            return _collect_global_constraints(model, t_end, st, inbuf_end, z_end)  # (B,Rg)
-
-        Xvar = Xall.clone().requires_grad_(True)
-        g_now = g_only(Xvar)  # (B,Rg)
-        J_full = torch.autograd.functional.jacobian(g_only, Xvar, create_graph=True)  # (B,Rg,B,S)
-
-        alpha = self.baumgarte_alpha
-        beta  = self.baumgarte_beta
-        S = Xvar.shape[1]
-        Rg = g_now.shape[1]
-
-        # g_dot = J f  (por batch)
-        gdot_list = []
-        for b in range(B):
-            Jb = J_full[b, :, b, :]            # (Rg,S)
-            fb = f_end[b].view(S, 1)           # (S,1)
-            gdot_b = (Jb @ fb).view(1, Rg)     # (1,Rg)
-            gdot_list.append(gdot_b)
-        gdot = torch.cat(gdot_list, dim=0)     # (B,Rg)
-
-        # g* = g + α dt g_dot + β dt^2 g
-        g_star = g_now + alpha * dt * gdot + beta * (dt ** 2) * g_now
-
-        # Reconstruir residual: bloques + g*
-        pieces = []
-        for bname in model.blocks.keys():
-            if bname in detail:
-                vv = detail[bname]; vv = vv if vv.ndim == 2 else vv.view(B, -1)
-                pieces.append(vv)
-        if Rg > 0:
-            pieces.append(g_star)
-        r_aug = torch.cat(pieces, dim=1) if len(pieces) > 0 else torch.zeros((B, 0), dtype=dtype, device=device)
-        return r_aug, detail
-    
-    def _baumgarte_residual(self,
-                            model,
-                            *,
-                            t_begin: float,
-                            states_begin: dict,
-                            inbuf_begin: dict,
-                            t_end: float,
-                            states_end: dict,
-                            inbuf_end: dict,
-                            z_end: torch.Tensor,
-                            dt: float) -> torch.Tensor:
-        """
-        Residual de Baumgarte a tiempo n+1:
-            F_BG = gdot^{n+1} + alpha * g^{n+1}
-        con gdot^{n+1} ≈ (g^{n+1} - g^{n}) / dt
-
-        Devuelve un tensor (B, Rg).
-        """
-        # g^n (no depende de z_end)
-        g_begin, _ = model.build_residual(t_begin, states_begin, inbuf_begin, z=None)
-        # g^{n+1} (sí puede depender de z_end vía estados_end/inbuf_end)
-        g_end,   _ = model.build_residual(t_end,   states_end,   inbuf_end,   z=z_end)
-
-        gdot = (g_end - g_begin) / float(dt)
-        Fbg  = gdot + self.baumgarte_alpha * g_end
-        return Fbg
-
