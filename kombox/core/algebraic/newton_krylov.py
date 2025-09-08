@@ -6,7 +6,11 @@ from torch import Tensor
 
 
 def _l2_norm(t: Tensor) -> Tensor:
-    # Norma por batch (B,) o escalar si B=1
+    """
+    Norma L2 por batch.
+    - Si t es (B, R) -> devuelve (B,)
+    - Si t es 1D/0D -> devuelve escalar tensorial
+    """
     if t.ndim == 2:
         return torch.sqrt(torch.sum(t * t, dim=1) + 1e-16)
     return torch.linalg.norm(t)
@@ -17,7 +21,7 @@ class NewtonKrylov:
     Solver algebraico F(z)=0 autograd-safe.
 
     Modos:
-      - mode="dense":   construye J explícito por batch (tu comportamiento actual).
+      - mode="dense":   construye J explícito por batch (forma densa).
       - mode="jfnk":    Jacobian-Free Newton–Krylov (JVP/VJP + CG sobre (J^T J + λI)).
 
     Uso:
@@ -68,46 +72,66 @@ class NewtonKrylov:
         else:
             raise ValueError(f"NewtonKrylov: modo desconocido '{self.mode}'. Use 'dense' o 'jfnk'.")
 
-    # ---------------- Implementación DENSE (tu comportamiento actual) ----------------
+    # ---------------- Implementación DENSE ----------------
     def _solve_dense(self, F: Callable[[Tensor], Tensor], z0: Tensor) -> Tensor:
         """
-        Forma J por batch con autograd.functional.jacobian y resuelve J dz = r; z <- z - dz.
+        Forma J por batch con autograd.functional.jacobian y resuelve:
+            J dz = r  (si J cuadrada)
+        o bien el *least squares* si J no es cuadrada.
         """
         z = z0.clone().requires_grad_(True)
         for _ in range(self.max_iter):
             r = F(z)  # (B,R)
-            if _l2_norm(r) <= self.tol:
+            rn = _l2_norm(r)
+            if float(rn.max()) <= self.tol:
                 return z
+
             # Jacobiano denso batcheado
             B = r.shape[0]
             rflat = r.reshape(B, -1)
             J_rows = []
+
             for b in range(B):
                 def fb(zb):
                     zz = z.clone()
                     zz[b] = zb.reshape_as(z[b])
                     return F(zz)[b].reshape(-1)
-                Jb = torch.autograd.functional.jacobian(fb, z[b], create_graph=True)  # (R,Z)
+                # Jb: (R,Z)
+                Jb = torch.autograd.functional.jacobian(fb, z[b], create_graph=True)
                 J_rows.append(Jb)
+
             # Resolver por batch
             dz_list = []
             for b in range(B):
-                rb = rflat[b]
-                Jb = J_rows[b]
-                dzb = torch.linalg.solve(Jb, rb)
+                rb = rflat[b].reshape(-1, 1)   # (R,1)
+                Jb = J_rows[b]                 # (R,Z)
+                Rb, Zb = Jb.shape
+                if Rb == Zb:
+                    # sistema cuadrado
+                    dzb = torch.linalg.solve(Jb, rb).reshape(Zb)
+                else:
+                    # least squares (robusto para R != Z)
+                    dzb = torch.linalg.lstsq(Jb, rb).solution.reshape(Zb)
                 dz_list.append(dzb)
+
             dz = torch.stack(dz_list, dim=0).reshape_as(z)
 
-            # Line search
+            # Line search (backtracking)
             step = 1.0
-            for _ls in range(6) if self.line_search else range(1):
-                z_try = (z - step * dz).detach().requires_grad_(True)
-                if _l2_norm(F(z_try)) < _l2_norm(r):
-                    z = z_try
-                    break
-                step *= 0.5
+            if self.line_search:
+                f0 = _l2_norm(r).detach()
+                for _ls in range(6):
+                    z_try = (z - step * dz).detach().requires_grad_(True)
+                    r_try = F(z_try)
+                    if float(_l2_norm(r_try).max()) < float(f0.max()):
+                        z = z_try
+                        break
+                    step *= 0.5
+                else:
+                    z = (z - dz).detach().requires_grad_(True)
             else:
                 z = (z - dz).detach().requires_grad_(True)
+
         return z
 
     # ---------------- Implementación JFNK (Jacobian-Free) ----------------
@@ -120,15 +144,12 @@ class NewtonKrylov:
         - v:    (B, R)
         Returns: (B, Z)
 
-        Robust to the case "F does not depend on z": in that situation ``y = F(z)``
-        will not require grad and ``autograd.grad`` would normally error. We detect
-        it and return zeros like ``z``. We also pass ``allow_unused=True`` and
-        sanitize possible ``None`` gradients.
+        Robusto cuando F no depende de z: devolvemos ceros del shape de z.
+        Usamos allow_unused=True y saneamos grad=None.
         """
         with torch.enable_grad():
             z = z.requires_grad_(True)
             y = F(z)
-            # If F does not depend on z, y won't require grad → J = 0.
             if not getattr(y, "requires_grad", False):
                 return torch.zeros_like(z)
             grad = torch.autograd.grad(
