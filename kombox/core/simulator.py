@@ -263,6 +263,9 @@ class Simulator:
         """Activa proyección pos-paso opcional (cada N pasos)."""
         self._proj_enabled = bool(enabled)
         self._proj_tol = float(tol)
+        # --- ajuste mínimo: usa el mismo atributo que el bucle de proyección ---
+        self._proj_maxit = int(max_iter)
+        # (mantenemos también el alias para compat)
         self._proj_max_iter = int(max_iter)
         self._proj_damping = float(damping)
         self._proj_every_n = max(1, int(every_n_steps))
@@ -705,9 +708,7 @@ class Simulator:
         # Recalcular salidas con estados proyectados
         inbuf_final, outs_final = build_inbuf_for(proj_states, t0 + dt)
 
-        # Proyección pos-paso también para la ruta no-global
-        new_states = self._project_states(new_states, self._inbuf, t0 + dt)
-        # Actualiza estados y outs coherentes con la proyección
+        # Commit final con estados proyectados y outs coherentes
         self.model.set_states(proj_states, validate_shapes=False)
         self._outs_cache = outs_final
         self.k += 1
